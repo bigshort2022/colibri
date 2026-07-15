@@ -5485,6 +5485,24 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
 }
 
+/* The user's generation prompt. COLI_PROMPT is honored on every platform; a bare
+ * PROMPT is honored too, EXCEPT on Windows, where cmd.exe always exports its own
+ * PROMPT template (default "$P$G", the thing that draws "C:\...>") into the child's
+ * environment. That is a shell UI string, not a prompt: taking it would send the
+ * engine into text-generation mode (needing a tokenizer) instead of the oracle
+ * self-test, and would "generate" from "$P$G". So on Windows a PROMPT carrying
+ * cmd's $-metacodes is ignored; set COLI_PROMPT to pass a real prompt from cmd. */
+static const char *coli_user_prompt(void){
+    const char *p = getenv("COLI_PROMPT");
+    if(p) return p;
+    p = getenv("PROMPT");
+#ifdef _WIN32
+    if(p) for(const char *q=p; q[0]; q++)
+        if(q[0]=='$' && q[1] && strchr("ABCDEFGHLNPQSTV_+|$", q[1]&~0x20)){ p=NULL; break; }
+#endif
+    return p;
+}
+
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
      * tiny and back-to-back; with the default passive wait policy libgomp parks
@@ -5750,9 +5768,10 @@ int main(int argc, char **argv){
     }
 
     /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */
-    if(getenv("PROMPT")){
+    const char *user_prompt = coli_user_prompt();   /* ignores cmd.exe's PROMPT template (#271) */
+    if(user_prompt){
         int ngen=getenv("NGEN")?atoi(getenv("NGEN")):64;
-        run_text(&m, snap, getenv("PROMPT"), ngen);
+        run_text(&m, snap, user_prompt, ngen);
         if(stats) stats_dump(&m,stats);
         return 0;
     }
