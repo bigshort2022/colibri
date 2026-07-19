@@ -35,11 +35,11 @@
 
           # python3 is needed by checkPhase: `make test-c` shells out to
           # `python3 tools/run_tests.py` (see c/Makefile, PYTHON ?= python3).
-          nativeBuildInputs = [pkgs.makeWrapper pkgs.python3];
+          nativeBuildInputs = with pkgs; [makeWrapper python3];
 
-          buildInputs = [
-            pkgs.gcc
-            pkgs.gmp
+          buildInputs = with pkgs; [
+            gcc
+            gmp
           ];
 
           # Use x86-64-v3 (AVX2) for a portable binary; override with ARCH=native for local builds
@@ -119,12 +119,12 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [colibri];
 
-          packages = [
+          packages = with pkgs; [
             pythonEnv
-            pkgs.gcc
-            pkgs.gnumake
-            pkgs.clang-tools # clangd / clang-tidy for IDE support
-            pkgs.pkg-config
+            gcc
+            gnumake
+            clang-tools # clangd / clang-tidy for IDE support
+            pkg-config
           ];
 
           shellHook = ''
