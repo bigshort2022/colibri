@@ -50,6 +50,52 @@ int main(int argc, char **argv) {
     if (coli_cuda_tensor_upload(&t8, q8, s8, 1, 5, 2, d0)) return 1;
     if (ndev > 1 && coli_cuda_tensor_upload(&t8, q8, s8, 1, 4, 2, d1)) return 1;
     if (!coli_cuda_matmul(&t8, got, x, q8, s8, 1, 2, 4, 2, d0) || !close_enough(got, want8, 4)) return 1;
+    /* Cached tensor must stay callable without live host pointers
+     * (CUDA_RELEASE_HOST slots null theirs after upload) — including
+     * SUSTAINED reuse, not just the first call. */
+    for (int rep = 0; rep < 64; rep++)
+        if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+            !close_enough(got, want8, 4)) return 1;
+    /* A tensor uploaded from a TEMPORARY host buffer must survive the buffer
+     * being scribbled and freed (the release-host lifecycle). */
+    {
+        int8_t *tmpw = static_cast<int8_t *>(std::malloc(8));
+        float  *tmps = static_cast<float *>(std::malloc(2 * sizeof(float)));
+        if (!tmpw || !tmps) return 2;
+        for (int i = 0; i < 8; i++) tmpw[i] = q8[i];
+        tmps[0] = s8[0]; tmps[1] = s8[1];
+        ColiCudaTensor *tt = nullptr;
+        if (!coli_cuda_tensor_upload(&tt, tmpw, tmps, 1, 4, 2, d0)) return 1;
+        for (int i = 0; i < 8; i++) tmpw[i] = 99;
+        std::free(tmpw); std::free(tmps);
+        if (!coli_cuda_matmul(&tt, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+            !close_enough(got, want8, 4)) return 1;
+        coli_cuda_tensor_free(tt);
+    }
+    /* Upload failures must be graceful and must not corrupt accounting —
+     * and must not poison LATER healthy launches (sticky-error regression). */
+    {
+        size_t c0 = 0, b0 = 0, c1 = 0, b1 = 0;
+        coli_cuda_stats(-1, &c0, &b0);
+        ColiCudaTensor *bad = nullptr;
+        if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 4, 2, 9999)) return 1;
+        if (coli_cuda_tensor_upload(&bad, q8, s8, 7, 4, 2, d0)) return 1;
+        if (coli_cuda_tensor_upload(&bad, q8, nullptr, 1, 4, 2, d0)) return 1;
+        if (coli_cuda_tensor_upload(&bad, nullptr, s8, 1, 4, 2, d0)) return 1;
+        if (coli_cuda_tensor_upload(&bad, q8, s8, 1, 1 << 20, 1 << 24, d0)) return 1; /* ~16 TB */
+        if (bad) return 1;
+        coli_cuda_stats(-1, &c1, &b1);
+        if (c0 != c1 || b0 != b1) return 1;
+        /* healthy launch immediately after the failed allocation */
+        if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+            !close_enough(got, want8, 4)) return 1;
+    }
+    /* Fault injection hook: on/off, restores cleanly. */
+    if (setenv("COLI_GPU_FAIL_AFTER", "0", 1)) return 2;
+    if (coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0)) return 1;
+    if (unsetenv("COLI_GPU_FAIL_AFTER")) return 2;
+    if (!coli_cuda_matmul(&t8, got, x, nullptr, nullptr, 1, 2, 4, 2, d0) ||
+        !close_enough(got, want8, 4)) return 1;
     const int8_t q8b[8]={-1,-2,-3,-4, 1,-2,3,-4};
     const float s8b[2]={1.f,.5f},want8b[4]={10.f,15.f,-3.f,-2.5f};
     if(!coli_cuda_tensor_update(t8,q8b,s8b)||
