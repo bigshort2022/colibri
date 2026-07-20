@@ -247,6 +247,32 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
 
 def free_gb(p): return shutil.disk_usage(p).free / 1e9
 
+def check_or_record_params(outdir, prefix, params):
+    """#383-class guard, mirrored onto the --repo download loops from the --indir
+    path's resume manifest (below): a resumed run with DIFFERENT conversion
+    parameters (bits, group size, PROJ_BITS, ...) must not silently mix bit-widths
+    across shards in the same outdir -- the #355 failure mode (a second pass with
+    changed flags overwriting/interleaving with a finished container in silence).
+    Unlike the --indir manifest this doesn't need to track per-shard completion:
+    the --repo loops already do that via out-NNNNN.safetensors existence, since
+    shard index maps directly to output filename there. Only whether the params
+    used SO FAR match this run's needs checking. Returns False (caller should
+    abort) on a mismatch, True otherwise; records params on first use."""
+    path = os.path.join(outdir, f".{prefix}params.json")
+    if os.path.exists(path):
+        try: prev = json.loads(open(path).read())
+        except (OSError, ValueError): prev = None
+        if prev is not None and prev != params:
+            print(f"ERROR: {path} records a conversion with {prev};\n"
+                  f"       this run uses {params}. Refusing to mix conversions in the "
+                  f"same outdir — use a fresh --outdir (or delete {path} and the "
+                  f"{prefix}*.safetensors shards to redo).")
+            return False
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: json.dump(params, f, indent=1)   # atomic write, same reasoning as the --indir manifest
+    os.replace(tmp, path)
+    return True
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=None)
@@ -440,7 +466,8 @@ def main():
         # EN: resume skips only what matches, and different parameters on the same
         # EN: outdir are refused instead of mixing containers (the #355 failure mode).
         params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
-                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map}
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
         prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
         prog = {}
         if os.path.exists(prog_path):
@@ -718,6 +745,10 @@ def main():
         except Exception: pass
     tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
     if a.mtp:
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
+        if not check_or_record_params(a.outdir, "out-mtp-", params): return
         import urllib.request
         idx = json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
@@ -737,6 +768,10 @@ def main():
             print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensors)", flush=True)
         shutil.rmtree(tmp, ignore_errors=True); print("[MTP] DONE."); return
     if a.indexer:
+        params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+                  "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+                  "proj_bits": dict(PROJ_BITS)}
+        if not check_or_record_params(a.outdir, "out-idx-", params): return
         import urllib.request
         idx = json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
@@ -756,6 +791,10 @@ def main():
                 if os.path.isfile(blob): os.remove(blob)
             print(f"    -> {os.path.basename(outp)} ({len(out)} tensors)", flush=True)
         shutil.rmtree(tmp, ignore_errors=True); print("[IDX] DONE."); return
+    params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
+              "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
+              "proj_bits": dict(PROJ_BITS)}
+    if not check_or_record_params(a.outdir, "out-", params): return
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
