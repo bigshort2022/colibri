@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""fmt=5 (E8/IQ3 grouped container) index codec — #452 ladder step 2.
+"""fmt=6 (E8/IQ3 lattice container) index codec — #452 ladder step 2.
+
+Note: fmt=5 is taken by the int3 dual-plane container (#132); this lattice
+container is fmt=6.
 
 The ablation (#453) proved the SCHEME: an IQ3_XXS-style codebook plus rotation
 matches our simulated E8 ball (51.5% vs 51.5% on OLMoE). That code quantizes to
@@ -7,7 +10,7 @@ lattice points and keeps floats. This module produces the DEPLOYABLE bytes and
 reads them back, so the container, the converter and the decode kernels all
 agree on one layout.
 
-Layout — one 256-weight super-block, 98 bytes, 3.0625 bpw:
+Layout - one 256-weight super-block, 98 bytes, 3.0625 bpw:
 
     [0  .. 63]  uint8  grid index per 4-dim magnitude block   (64 blocks)
     [64 .. 95]  uint32 x8, one per 32-weight sub-block:

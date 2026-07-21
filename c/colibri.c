@@ -97,6 +97,9 @@ typedef struct {
 /* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte), 4 INT4-GROUPED, 5 INT3-G64.
  * q4 ospita int4/int2/int3 packed. fmt=4 (grouped int4, #242): per-row nibbles + one f32
  * scale per group of `gs` inputs (s has O*ceil(I/gs) entries).
+ * fmt=6 (E8/IQ3 lattice, #452): 98B per 256 weights = 3.0625 bits/weight, grid
+ * indices + parity-packed signs + sub-scales + fp16 super-scale, ALL inside q4 —
+ * `s` is unused for this format (see quant.h E8_* and tools/iq3_pack.py).
  * fmt=5 (int3, per-GROUP scales, group=64, see quant.h I3_*): values in [-4,3] stored per
  * 64-input group as 24 bytes = 16B low plane (2 bits/val, int2 layout) + 8B high plane
  * (1 bit/val), plus ONE f32 scale PER GROUP (s has O*ceil(I/64) entries, not O). 3.5
@@ -278,6 +281,7 @@ static double g_cuda_expert_gb;
 static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
+static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -539,6 +543,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
+    if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
@@ -733,6 +738,11 @@ static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer de
 static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L+1's router,
                           * approximate MoE(L) using only the shared expert (resident, no disk)
                           * and add it to the state. Trades 3 small matmuls for +2.3% recall. */
+static int g_pilot_evict_guard=1;/* PILOT_EVICT_GUARD=0 -> old behavior (a speculation evicts the plain LRU).
+                          * Default ON: a speculative pilot load may evict a RESIDENT expert only if the
+                          * predicted expert is historically HOTTER than the victim (same LFRU hysteresis as
+                          * tier_pick_lfru); otherwise it drops the speculation rather than thrash a warm
+                          * demand-loaded expert. Cache placement only -> output byte-identical. (#441) */
 /* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
  *  1) Percorso MATMUL (moe): il pilota scrive SOLO ecache[layer] con layer > g_cur_moe_layer;
  *     il matmul in moe() legge SOLO ecache[layer]==g_cur_moe_layer, e la barriera a inizio moe()
@@ -1385,9 +1395,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
-    char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    /* suf as a bounded char[][16] (not const char*) lets GCC prove the %s in the
+     * nm[k]/qn snprintfs can't overflow: worst key is "model.layers.<i>.mlp.experts.<i>.down_proj.weight"
+     * = 66 bytes incl NUL, well under nm[288] and qn[320]. See #484. */
+    char nm[3][288]; const char suf[3][16]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
-    char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
+    char qn[320]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime.
                                                   * Reachable ONLY for unquantized models (no .qs);
                                                   * GLM always has .qs, so the pilot never hits it. */
@@ -1658,7 +1671,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int li=b->nload++;
     UringLoad *l=&b->load[li]; memset(l,0,sizeof(*l));
     l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
-    char nm[3][288],qn[300]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    char nm[3][288],qn[320]; const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
     snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(g_mmap || !st_has(&m->S,qn))
@@ -2525,7 +2538,26 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
-                float a=0; for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
+                /* MLA-absorb score: dot(qabs, Lt) + dot(qr, kr). #442: the qabs·Lt
+                 * reduction is the hot f32 dot at this site (kvl=512 on GLM-5.2,
+                 * runs nt times per (s,h), grows with context). SIMD-ify under
+                 * AVX2 (8-lane fmadd + hsum256, same shape as matmul_q in quant.h)
+                 * and NEON, with a scalar tail for the remainder. Reassociation
+                 * is accepted here — softmax downstream softens the rounding flip. */
+                float a=0; int i=0;
+#if defined(__AVX2__)
+                __m256 acc=_mm256_setzero_ps();
+                for(;i+8<=kvl;i+=8)
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+i), _mm256_loadu_ps(Lt+i), acc);
+                a=hsum256(acc);
+#elif defined(__ARM_NEON)
+                float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+                for(;i+8<=kvl;i+=8){
+                    ac0=vfmaq_f32(ac0, vld1q_f32(qabs+i),   vld1q_f32(Lt+i));
+                    ac1=vfmaq_f32(ac1, vld1q_f32(qabs+i+4), vld1q_f32(Lt+i+4)); }
+                a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+                for(;i<kvl;i++) a+=qabs[i]*Lt[i];
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
                 sc[jj]=a*c->attn_scale;
             }
@@ -2533,7 +2565,25 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float clat[512]; memset(clat,0,kvl*sizeof(float));
             for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
-                float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
+                /* MLA-absorb value mix: clat += sc[jj] * Lt (AXPY over kvl).
+                 * #442: SIMD-ified — each lane writes back independently so there
+                 * is no reassociation here (strictly bit-identical to scalar). */
+                float a=sc[jj]; int i=0;
+#if defined(__AVX2__)
+                __m256 va=_mm256_set1_ps(a);
+                for(;i+8<=kvl;i+=8){
+                    __m256 cl=_mm256_loadu_ps(clat+i), lt=_mm256_loadu_ps(Lt+i);
+                    _mm256_storeu_ps(clat+i, _mm256_fmadd_ps(va, lt, cl));
+                }
+#elif defined(__ARM_NEON)
+                float32x4_t va=vdupq_n_f32(a);
+                for(;i+8<=kvl;i+=8){
+                    vst1q_f32(clat+i,   vfmaq_f32(vld1q_f32(clat+i),   va, vld1q_f32(Lt+i)));
+                    vst1q_f32(clat+i+4, vfmaq_f32(vld1q_f32(clat+i+4), va, vld1q_f32(Lt+i+4)));
+                }
+#endif
+                for(;i<kvl;i++) clat[i]+=a*Lt[i];
+            }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
         }
@@ -3494,7 +3544,16 @@ static void pilot_realload(Model *m, int layer, int eid){
     for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
     int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
     if(nn<m->ecap){ slot=nn; isnew=1; }
-    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0; }
+    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0;
+        /* LFRU eviction guard (#441): a speculation must not drop a WARM demand-loaded expert.
+         * Evict only if the predicted expert's history is hotter than the victim by tier_pick_lfru's
+         * hysteresis (25% + 4 freq); else drop the speculation. Cache placement only -> output unchanged. */
+        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[lru].eid>=0){
+            int vid=Sl[lru].eid;
+            uint64_t vs=tier_lfru_score(m->eheat[layer][vid],m->elast[layer][vid],m->eaccess_clock);
+            uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+            if(cs<=vs+(vs>>2)+(4u<<8)){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                        pthread_mutex_unlock(&g_pilot_mx); return; } } }
     ESlot *dst=&Sl[slot];
     dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
     g_pilot_inflight[layer]++;
@@ -3544,6 +3603,14 @@ static void pilot_uring_batch(Model *m){
                 if(Sl[z].eid==-1){ slot=z; break; }
                 if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
                 if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
+            }
+            /* LFRU eviction guard (#441): don't drop a warm resident for a speculation (see pilot_realload) */
+            if(slot>=0 && Sl[slot].eid>=0 && g_pilot_evict_guard && m->eheat && m->elast){
+                int vid=Sl[slot].eid;
+                uint64_t vs=tier_lfru_score(m->eheat[layer][vid],m->elast[layer][vid],m->eaccess_clock);
+                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
+                if(cs<=vs+(vs>>2)+(4u<<8)){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
+                                            pthread_mutex_unlock(&g_pilot_mx); continue; }
             }
         }
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
@@ -5684,12 +5751,12 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
     if(!cnt||!first){ free(cnt); free(first); return; }
     for(int i=0;i<NR;i++) first[i]=-1;
     for(int a=from;a<to;a++){ if(first[r[a].l]<0) first[r[a].l]=a; cnt[r[a].l]++; }
-    const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int l=0;l<NR;l++){
         if(cnt[l]<2) continue;
         int64_t wtot=0, qtot=0; int ok=1;
         for(int k=0;k<3 && ok;k++){
-            char nm[288],qn[300];
+            char nm[288],qn[320];
             snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.%s.weight",l,r[first[l]].e,suf[k]);
             snprintf(qn,sizeof qn,"%s.qs",nm);
             st_tensor *tw=st_find(&m->S,nm), *tq=st_find(&m->S,qn);
@@ -5767,11 +5834,16 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
         size_t free_b=0,total_b=0;
         if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-g_cuda_reserve_gb*1e9;
             if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
         }
     }
-    if(g_cuda_expert_auto||budget>safe_total) budget=safe_total;
+    /* auto: fill to measured headroom (safe_total). An explicit CUDA_EXPERT_GB is
+     * honored as-is even when it exceeds headroom; per-expert upload failure below
+     * (remaining[best]=0, continue to next expert) degrades gracefully rather
+     * than OOM-ing. Previously both paths were clamped, which silently capped the
+     * tier under CUDA_DENSE=1 regardless of the configured budget (#491). */
+    if(g_cuda_expert_auto) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
         prefix_est=(int)(budget/eb)+g_cuda_ndev;
         npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
@@ -5841,8 +5913,11 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 }
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
-            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (budget %.1f GB%s, reserve %.1f GB)\n",
+            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,
+            g_cuda_expert_auto?safe_total/1e9:budget/1e9,
+            g_cuda_expert_auto?", auto":"",
+            g_cuda_reserve_gb);
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
@@ -6083,6 +6158,18 @@ int main(int argc, char **argv){
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
+        /* #471: execv PRESERVES the CPU affinity mask. If the user exported
+         * OMP_PROC_BIND/OMP_PLACES, libgomp's constructor already bound THIS thread to
+         * place 0 (one core's SMT siblings) before main() ran; the re-exec'd image would
+         * inherit that 1-core mask, enumerate OMP_PLACES=cores inside it, and jail the
+         * whole team on one core (measured ~20x slowdown). Reset to all online CPUs so
+         * the fresh libgomp binds from the full set — the user's OMP_* env still wins. */
+        { cpu_set_t all; CPU_ZERO(&all);
+          long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+          if(ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
+          for(long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
+          if(sched_setaffinity(0, sizeof(all), &all) != 0)
+              perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
@@ -6172,6 +6259,7 @@ int main(int argc, char **argv){
     if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implica il pilota attivo */
     g_pilot_two = getenv("PILOT_TWO")?atoi(getenv("PILOT_TWO")):0; /* 1 = two-step: shared-expert-corrected router prediction (+2.3% recall, 3 extra matmuls) */
     if(g_pilot_two) g_pilot=1;                            /* PILOT_TWO implies PILOT active */
+    g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1; /* 0 = old LRU eviction (A/B) */
     /* Default K: hint-only PILOT keeps 8 (WILLNEED hints are free, no eviction).
      * Under PILOT_REAL the speculative loads are REAL and create LRU eviction
      * pressure, so at ~28% mispredict a large K thrashes the cache — default to 6
@@ -6263,6 +6351,7 @@ int main(int argc, char **argv){
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
+    g_cuda_reserve_gb=getenv("CUDA_RESERVE_GB")?atof(getenv("CUDA_RESERVE_GB")):2.0;
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);

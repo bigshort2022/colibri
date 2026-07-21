@@ -669,6 +669,11 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O, int device, int gs) {
     if (fault_injected()) return 0;
+    /* fmt=4 carries [O, ceil(I/gs)] scales: without the group size the plain
+     * upload truncates the buffer to O floats and quant_matmul divides by
+     * gs==0. Callers must come through the gs>0 path (upload_g) or stay on
+     * the CPU (#298, #334). */
+    if (fmt == 4 && gs <= 0) return 0;
     if (S < 1) return 0;
     if (gs > 0) { if (!coli_cuda_tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs)) return 0; }
     else        { if (!coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0; }
@@ -690,6 +695,11 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                                       ColiCudaTensor *down, float *y,
                                       const float *x, int S) {
     if (fault_injected()) return 0;
+    /* same reason as coli_cuda_matmul: fmt=4 without recorded group info would
+     * misread the scales (and divide by gs==0 in the kernel). */
+    if (gate && ((gate->fmt == 4 && gate->gs <= 0) ||
+                 (up && up->fmt == 4 && up->gs <= 0) ||
+                 (down && down->fmt == 4 && down->gs <= 0))) return 0;
     if (!gate || !up || !down || !x || !y || S < 1 ||
         gate->device != up->device || gate->device != down->device ||
         gate->I != up->I || gate->O != up->O ||

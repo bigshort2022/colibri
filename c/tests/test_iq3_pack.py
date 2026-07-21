@@ -1,4 +1,4 @@
-"""fmt=5 codec oracle (#452 ladder step 2).
+"""fmt=6 codec oracle (#452 ladder step 2).
 
 Checks the properties the container, the converter and the decode kernels all
 depend on: exact byte budget, deterministic encode, decode agreeing with a
