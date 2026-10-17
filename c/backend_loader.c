@@ -95,6 +95,12 @@ typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, 
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs);
+typedef ColiCudaDn    *(*fn_dn_create)(int device, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden, const float *conv_w, const float *norm_w, float eps, int gate_sigmoid);
+typedef void           (*fn_dn_free)(ColiCudaDn *d);
+typedef int            (*fn_dn_set_state)(ColiCudaDn *d, const float *ring, const float *rec);
+typedef int            (*fn_dn_get_state)(ColiCudaDn *d, float *ring, float *rec);
+typedef int            (*fn_dn_step)(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp, const float *x, float *out, const float *egh, const float *beta);
+typedef int            (*fn_tensor_overwrite)(ColiCudaTensor *tensor, const void *weights, const float *scales);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
@@ -102,6 +108,11 @@ typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const flo
                                     int fmt, int S, int I, int O, int device, int gs);
 typedef int            (*fn_matmul_mxfp4)(float *y, const float *x, const unsigned char *q4,
                                           const unsigned char *e8s, int S, int I, int O);
+typedef int (*fn_expert_mxfp4)(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_vram)(const ColiCudaTensor *tensor);
@@ -175,10 +186,13 @@ static struct {
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
+    fn_dn_create dn_create; fn_dn_free dn_free; fn_dn_set_state dn_set_state; fn_dn_get_state dn_get_state; fn_dn_step dn_step;   /* optional: gated delta layer on the device */
+    fn_tensor_overwrite tensor_overwrite;   /* optional: DLLs before it leave it NULL */
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
     fn_matmul_mxfp4    matmul_mxfp4;
+    fn_expert_mxfp4    expert_mxfp4;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_vram     tensor_vram;
@@ -1426,6 +1440,12 @@ static int coli_cuda_load(void){
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
+    RESOLVE_OPT(dn_create, fn_dn_create)
+    RESOLVE_OPT(dn_free, fn_dn_free)
+    RESOLVE_OPT(dn_set_state, fn_dn_set_state)
+    RESOLVE_OPT(dn_get_state, fn_dn_get_state)
+    RESOLVE_OPT(dn_step, fn_dn_step)
+    RESOLVE_OPT(tensor_overwrite, fn_tensor_overwrite)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
@@ -1433,6 +1453,7 @@ static int coli_cuda_load(void){
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
+    RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
     RESOLVE_OPT(available_device_count, fn_available_device_count)   /* qwen36 tier (#1533); older DLLs fall back to device_count */
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -1633,6 +1654,24 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, cons
     return g_cuda.tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs);
 }
 
+/* Gated delta layer on the device: every entry point is optional, a DLL
+ * predating them answers NULL/0 and the engine keeps the layer on the CPU. */
+ColiCudaDn *coli_cuda_dn_create(int device, int vh, int vk, int kdim, int vdim, int conv_dim, int convk, int hidden, const float *conv_w, const float *norm_w, float eps, int gate_sigmoid){
+    if(!g_cuda.available || !g_cuda.dn_create || !g_cuda.dn_free || !g_cuda.dn_set_state || !g_cuda.dn_get_state || !g_cuda.dn_step) return NULL;
+    return g_cuda.dn_create(device, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps, gate_sigmoid);
+}
+void coli_cuda_dn_free(ColiCudaDn *d){ if(d && g_cuda.dn_free) g_cuda.dn_free(d); }
+int coli_cuda_dn_set_state(ColiCudaDn *d, const float *ring, const float *rec){ return d && g_cuda.dn_set_state ? g_cuda.dn_set_state(d, ring, rec) : 0; }
+int coli_cuda_dn_get_state(ColiCudaDn *d, float *ring, float *rec){ return d && g_cuda.dn_get_state ? g_cuda.dn_get_state(d, ring, rec) : 0; }
+int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp, const float *x, float *out, const float *egh, const float *beta){
+    return d && g_cuda.dn_step ? g_cuda.dn_step(d, proj, projz, outp, x, out, egh, beta) : 0;
+}
+
+int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales){
+    if(!g_cuda.available || !g_cuda.tensor_overwrite) return 0;   /* older DLL: the tier frees and uploads instead */
+    return g_cuda.tensor_overwrite(tensor, weights, scales);
+}
+
 int coli_cuda_e8_set_grid(const void *grid){
     if(!g_cuda.available || !g_cuda.e8_set_grid) return 0;   /* fmt=6 stays CPU-side */
     return g_cuda.e8_set_grid(grid);
@@ -1654,6 +1693,15 @@ int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,
                            const unsigned char *e8s, int S, int I, int O){
     if(!g_cuda.available || !g_cuda.matmul_mxfp4) return 0;   /* 0 = CPU path */
     return g_cuda.matmul_mxfp4(y, x, q4, e8s, S, I, O);
+}
+
+int coli_cuda_expert_mxfp4(float *y, const float *x,
+        const unsigned char *gate_w, const unsigned char *gate_s,
+        const unsigned char *up_w, const unsigned char *up_s,
+        const unsigned char *down_w, const unsigned char *down_s,
+        int S, int D, int I, float b1, float b2) {
+    if (!g_cuda.available || !g_cuda.expert_mxfp4) return 0;
+    return g_cuda.expert_mxfp4(y, x, gate_w, gate_s, up_w, up_s, down_w, down_s, S, D, I, b1, b2);
 }
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){

@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+#include "load_fail.h"
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -33,7 +34,7 @@ typedef struct {
     int     fd;
     int64_t off;       /* offset assoluto del dato dentro al file */
     int64_t nbytes;
-    int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 */
+    int     dtype;     /* 0=BF16 1=F16 2=F32 3=U8/I8 4=F8_E4M3 5=F8_E8M0 6=I64 7=U32/I32 */
     int64_t numel;
     int     rank;
     int64_t shape[ST_MAX_RANK];
@@ -95,7 +96,13 @@ static int st_dtype_code(const char *s) {
         !strcmp(s, "float8_e4m3fn")) return 4;
     if (!strcmp(s, "F8_E8M0") || !strcmp(s, "F8_E8M0FNU")) return 5;
     if (!strcmp(s, "I64") || !strcmp(s, "U64")) return 6;
-    fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
+    /* I32/U32: token ids in reference dumps (tools/make_qwenimage_tiny.py), and
+     * the packed U32 words of MLX affine-quantized checkpoints (Swiftlet qpack
+     * containers included; qwen36's dense affine loader reads them through
+     * st_read_raw after validating the packed geometry). Same rule as the fp8
+     * codes above: a new number, read raw, refused by the float readers. */
+    if (!strcmp(s, "I32") || !strcmp(s, "U32")) return 7;
+    coli_load_fail(COLI_LOAD_FAIL_UNSUPPORTED, "unsupported dtype: %s", s);
 }
 
 /* Byte per elemento. UNICO posto che lo sa: prima la formula era ripetuta in tre
@@ -106,6 +113,7 @@ static inline int st_dtype_esz(int dtype) {
         case 2: return 4;                 /* F32 */
         case 3: case 4: case 5: return 1; /* U8/I8, F8_E4M3, F8_E8M0 */
         case 6: return 8;                 /* I64/U64 */
+        case 7: return 4;                 /* I32/U32 */
         default: return 2;                /* BF16, F16 */
     }
 }
@@ -115,7 +123,7 @@ static inline const char *st_dtype_name(int dtype) {
     switch (dtype) {
         case 0: return "BF16"; case 1: return "F16"; case 2: return "F32";
         case 3: return "U8/I8"; case 4: return "F8_E4M3"; case 5: return "F8_E8M0";
-        case 6: return "I64"; default: return "?";
+        case 6: return "I64"; case 7: return "I32"; default: return "?";
     }
 }
 
@@ -138,12 +146,128 @@ static inline float f16_to_f32(uint16_t h) {
     float f; memcpy(&f, &u, 4); return f;
 }
 
+/* ---- bulk BF16/F16 -> F32, AVX2/SSE4.1/scalar tiers --------------------
+ * st_read_f32/st_read_slice_f32 convert whole tensors (up to the embed/
+ * lm_head matrix, vocab*hidden elements) through bf16_to_f32/f16_to_f32 one
+ * halfword at a time; that loop is pure overhead once the read syscall is
+ * off the critical path. The tiers below batch it, same idea and layering
+ * as gsgemv.h's AVX2/SSE4.1 kernels (immintrin.h only under the ISA guard,
+ * sse41_kernels.h not needed here -- no FMA, no shared load helper to reuse).
+ *
+ * BF16 -> F32 is an exact zero-pad widening for every bit pattern (BF16
+ * shares F32's 8-bit exponent field, so there is no special-casing --
+ * zero, normal, subnormal, inf, NaN all take the same `<<16`), so the
+ * vectorized tiers cannot disagree with the scalar reference.
+ *
+ * F16 -> F32's zero/normal/inf-NaN classes are each the same closed-form
+ * bit algebra as the scalar reference above, just run on several lanes at
+ * once -- no reassociation, nothing to round, so still bit-exact. True
+ * subnormals (exp==0, man!=0) need the scalar reference's shift-to-normalize
+ * loop, which does not vectorize; those (rare in real model weights) fall
+ * back to f16_to_f32 per element. Exhaustive verification (all 65536
+ * patterns per format) lives in tests/test_st_f16_bf16_simd.c. */
+#if defined(__AVX2__) || defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
+#if defined(__AVX2__)
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i*)(src + i));
+        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    const __m256i vsign_mask = _mm256_set1_epi32(0x8000);
+    const __m256i vexp_mask  = _mm256_set1_epi32(0x1F);
+    const __m256i vman_mask  = _mm256_set1_epi32(0x3FF);
+    const __m256i v112       = _mm256_set1_epi32(112);
+    const __m256i vinfnan_e  = _mm256_set1_epi32(0x7F800000);
+    const __m256i vzero      = _mm256_setzero_si256();
+    const __m256i v31        = _mm256_set1_epi32(31);
+    for (; i + 8 <= n; i += 8) {
+        __m128i h16 = _mm_loadu_si128((const __m128i*)(src + i));
+        __m256i h    = _mm256_cvtepu16_epi32(h16);
+        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(h, vsign_mask), 16);
+        __m256i exp  = _mm256_and_si256(_mm256_srli_epi32(h, 10), vexp_mask);
+        __m256i man  = _mm256_and_si256(h, vman_mask);
+        __m256i normal_u = _mm256_or_si256(sign, _mm256_or_si256(
+            _mm256_slli_epi32(_mm256_add_epi32(exp, v112), 23), _mm256_slli_epi32(man, 13)));
+        __m256i infnan_u = _mm256_or_si256(sign, _mm256_or_si256(vinfnan_e, _mm256_slli_epi32(man, 13)));
+        __m256i exp_is_zero = _mm256_cmpeq_epi32(exp, vzero);
+        __m256i man_is_zero = _mm256_cmpeq_epi32(man, vzero);
+        __m256i is_zero    = _mm256_and_si256(exp_is_zero, man_is_zero);
+        __m256i is_subnorm = _mm256_andnot_si256(man_is_zero, exp_is_zero);
+        __m256i is_infnan  = _mm256_cmpeq_epi32(exp, v31);
+        __m256i result = _mm256_blendv_epi8(normal_u, sign, is_zero);
+        result = _mm256_blendv_epi8(result, infnan_u, is_infnan);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(result));
+        int m = _mm256_movemask_ps(_mm256_castsi256_ps(is_subnorm));
+        if (m) for (int k = 0; k < 8; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
+    }
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#elif defined(__SSE4_1__)
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m128i h = _mm_loadl_epi64((const __m128i*)(src + i));
+        __m128i w = _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16);
+        _mm_storeu_ps(dst + i, _mm_castsi128_ps(w));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    const __m128i vsign_mask = _mm_set1_epi32(0x8000);
+    const __m128i vexp_mask  = _mm_set1_epi32(0x1F);
+    const __m128i vman_mask  = _mm_set1_epi32(0x3FF);
+    const __m128i v112       = _mm_set1_epi32(112);
+    const __m128i vinfnan_e  = _mm_set1_epi32(0x7F800000);
+    const __m128i vzero      = _mm_setzero_si128();
+    const __m128i v31        = _mm_set1_epi32(31);
+    for (; i + 4 <= n; i += 4) {
+        __m128i h16 = _mm_loadl_epi64((const __m128i*)(src + i));
+        __m128i h    = _mm_cvtepu16_epi32(h16);
+        __m128i sign = _mm_slli_epi32(_mm_and_si128(h, vsign_mask), 16);
+        __m128i exp  = _mm_and_si128(_mm_srli_epi32(h, 10), vexp_mask);
+        __m128i man  = _mm_and_si128(h, vman_mask);
+        __m128i normal_u = _mm_or_si128(sign, _mm_or_si128(
+            _mm_slli_epi32(_mm_add_epi32(exp, v112), 23), _mm_slli_epi32(man, 13)));
+        __m128i infnan_u = _mm_or_si128(sign, _mm_or_si128(vinfnan_e, _mm_slli_epi32(man, 13)));
+        __m128i exp_is_zero = _mm_cmpeq_epi32(exp, vzero);
+        __m128i man_is_zero = _mm_cmpeq_epi32(man, vzero);
+        __m128i is_zero    = _mm_and_si128(exp_is_zero, man_is_zero);
+        __m128i is_subnorm = _mm_andnot_si128(man_is_zero, exp_is_zero);
+        __m128i is_infnan  = _mm_cmpeq_epi32(exp, v31);
+        __m128i result = _mm_blendv_epi8(normal_u, sign, is_zero);
+        result = _mm_blendv_epi8(result, infnan_u, is_infnan);
+        _mm_storeu_ps(dst + i, _mm_castsi128_ps(result));
+        int m = _mm_movemask_ps(_mm_castsi128_ps(is_subnorm));
+        if (m) for (int k = 0; k < 4; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
+    }
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#else
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    for (int64_t i = 0; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    for (int64_t i = 0; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#endif
+
 static int st_open_fd(shards *S, const char *path) {
     for (int i = 0; i < S->nfd; i++) if (!strcmp(S->paths[i], path)) return S->fds[i];
     int fd = open(path, COMPAT_O_RDONLY);
-    if (fd < 0) { perror(path); exit(1); }
+    if (fd < 0) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", path, strerror(errno));
     struct stat sb;
-    if (fstat(fd, &sb) != 0) { perror("fstat shard"); close(fd); exit(1); }
+    if (fstat(fd, &sb) != 0) { int saved = errno; close(fd);
+        coli_load_fail(coli_load_fail_kind_from_errno(saved), "fstat shard: %s", strerror(saved)); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
     S->sizes[S->nfd] = (int64_t)sb.st_size;
 #ifdef O_DIRECT
@@ -267,14 +391,15 @@ static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char 
         ssize_t r = pread(fd, p + got, (size_t)want, off + got);
         if (r < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "%s: %s (off %lld, %lld/%lld bytes)\n", tag, strerror(errno),
-                    (long long)off, (long long)got, (long long)n);
-            exit(1);
+            int saved = errno;
+            coli_load_fail(coli_load_fail_kind_from_errno(saved),
+                           "%s: %s (off %lld, %lld/%lld bytes)", tag, strerror(saved),
+                           (long long)off, (long long)got, (long long)n);
         }
         if (r == 0) {
-            fprintf(stderr, "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?\n",
-                    tag, (long long)off, (long long)got, (long long)n);
-            exit(1);
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT,
+                           "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?",
+                           tag, (long long)off, (long long)got, (long long)n);
         }
         got += r;
     }
@@ -332,7 +457,7 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] is not a JSON string -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
     char *arena2 = NULL;
-    jval *inner = json_parse(stamp->str, &arena2);
+    jval *inner = json_parse_checked(stamp->str);
     if (!inner || inner->t != J_OBJ) {
         fprintf(stderr, "%s: __metadata__[\"colibri.fmt\"] does not parse as a JSON object -- malformed stamp, refusing (untrusted container)\n",
                 shard_path); exit(1); }
@@ -449,7 +574,9 @@ static const char *st_basename(const char *p) {
 static void st_index_load(st_index *ix, const char *dir) {
     if (ix->tried) return;
     ix->tried = 1;
-    char path[1200]; snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
+    char path[1200];
+    int written = snprintf(path, sizeof(path), "%s/model.safetensors.index.json", dir);
+    if (written < 0 || (size_t)written >= sizeof(path)) return;
     FILE *f = fopen(path, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
@@ -457,14 +584,14 @@ static void st_index_load(st_index *ix, const char *dir) {
     char *text = malloc((size_t)size + 1);
     if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) { free(text); fclose(f); return; }
     text[size] = 0; fclose(f);
-    ix->root = json_parse(text, &ix->arena);
+    ix->root = memchr(text, 0, (size_t)size) ? NULL : json_parse_checked(text);
     free(text);
     jval *map = ix->root ? json_get(ix->root, "weight_map") : NULL;
     if (!map || map->t != J_OBJ) { json_free(ix->root); ix->root = NULL; free(ix->arena); ix->arena = NULL; return; }
     ix->map = map;
     ix->hcap = 1; while (ix->hcap < map->len * 2) ix->hcap <<= 1;
     ix->h = malloc((size_t)ix->hcap * sizeof(int));
-    if (!ix->h) { fprintf(stderr, "OOM indexing model.safetensors.index.json\n"); exit(1); }
+    if (!ix->h) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "OOM indexing model.safetensors.index.json");
     for (int i = 0; i < ix->hcap; i++) ix->h[i] = -1;
     for (int i = 0; i < map->len; i++) {
         uint64_t hh = st_hash(map->keys[i]) & (ix->hcap - 1);
@@ -496,7 +623,7 @@ static void st_index_free(st_index *ix) {
  * returns how many shards this dir contributed. */
 static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added) {
     DIR *d = opendir(dir); struct dirent *e;
-    if (!d) { perror(dir); exit(1); }
+    if (!d) coli_load_fail(coli_load_fail_kind_from_errno(errno), "%s: %s", dir, strerror(errno));
     int base_n = *nf;
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
@@ -589,17 +716,19 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
          * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
          * malloc gigante. */
         if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
-            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
-                    files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: bad safetensors header length %llu (file %lld bytes)",
+                           files[fi], (unsigned long long)hlen, (long long)fsz); }
         char *hdr = malloc(hlen + 1);
-        if (!hdr) { perror("malloc safetensors header"); exit(1); }
+        if (!hdr) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc safetensors header: %s", strerror(errno));
         st_pread_full(fd, hdr, (int64_t)hlen, 8, "pread hdr");
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
-        jval *root = json_parse(hdr, &arena);
+        /* A partial object must not index weights or authorize an overlay.
+         * Header padding is JSON whitespace; embedded NUL is not padding. */
+        jval *root = memchr(hdr, 0, (size_t)hlen) ? NULL : json_parse_checked(hdr);
         if (!root || root->t != J_OBJ) {
-            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: safetensors header is not a JSON object", files[fi]); }
         st_fmt_stamp_ingest(S, root, files[fi]);
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
@@ -949,14 +1078,14 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         fprintf(stderr, "%s: tensor '%s' shape/bytes mismatch (numel %lld, %lld bytes, dtype %d) — refusing (hostile or corrupt file)\n",
                 name, name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
     void *raw = malloc(t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for tensor %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
+        bf16_to_f32_bulk((uint16_t *)raw, out, t->numel);
     } else {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
+        f16_to_f32_bulk((uint16_t *)raw, out, t->numel);
     }
     free(raw);
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
@@ -1034,7 +1163,7 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
         fprintf(stderr, "scale %s: F8_E8M0 numel %lld disagrees with %lld bytes\n",
                 name, (long long)t->numel, (long long)t->nbytes); exit(1); }
     uint8_t *raw = (uint8_t*)malloc((size_t)t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for scale %s failed\n", (long long)t->nbytes, name); exit(1); }
+    if (!raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for scale %s failed", (long long)t->nbytes, name);
     st_pread_full(t->fd, raw, t->nbytes, t->off, "pread ue8m0 scale");
     for (int64_t i = 0; i < t->numel; i++) out[i] = ue8m0_to_f32(raw[i]);
     free(raw);
@@ -1338,12 +1467,12 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
         fprintf(stderr, "slice %s byte arithmetic/destination is invalid — refusing\n", name); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = nb ? malloc((size_t)nb) : NULL;
-    if (nb && !raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
+    if (nb && !raw) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "malloc %lld bytes for slice %s failed", (long long)nb, name);
     if (nb) st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (nb) {
         if (t->dtype == 2) memcpy(out, raw, (size_t)nb);
-        else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
-        else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
+        else if (t->dtype == 0) bf16_to_f32_bulk((uint16_t *)raw, out, n_elems);
+        else f16_to_f32_bulk((uint16_t *)raw, out, n_elems);
     }
     free(raw);
     if (drop && nb) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
