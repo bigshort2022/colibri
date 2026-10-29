@@ -1799,9 +1799,24 @@ static const char *prompt_reject(int np, int want) {
 }
 
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
-                 uint8_t *audio; int alen; } SReq;   /* raw DMel bytes after the payload */
+                 uint8_t *audio; int alen; int stop_requested; } SReq;
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static int g_input_closed, g_input_bad;
+
+static void serve_clear_queue(void) {
+    for (int i = 0; i < g_qn; i++) { free(g_q[i].payload); free(g_q[i].audio); }
+    g_qn = 0;
+}
+
+static void serve_emit_terminal(const char *id, int control, int emitted, double tps,
+                                double hit, double rss, int prompt_tokens, int length_limited) {
+    if (control == 3) printf("ERROR %s CANCELLED\n", id);
+    else if (control == -2) printf("ERROR %s BAD_FRAME\n", id);
+    else printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", id, emitted,
+                tps, hit, rss, prompt_tokens, control == 1 ? 0 : length_limited);
+    fflush(stdout);
+}
 
 static int stdin_readable(void) {
     /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
@@ -1809,64 +1824,118 @@ static int stdin_readable(void) {
     return coli_stdin_readable();
 }
 
-/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
- * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+static int serve_bad_frame(const char *id, const char *active_id) {
+    g_input_bad = g_input_closed = 1;
+    serve_clear_queue();
+    if (id && (!active_id || strcmp(id, active_id)))
+        serve_emit_terminal(id, -2, 0, 0, 0, 0, 0, 0);
+    return -2;
+}
+
+static int serve_integer(const char *s, long long *value) {
+    char *end; errno = 0; *value = strtoll(s, &end, 10);
+    return end != s && !*end && errno != ERANGE;
+}
+
+/* -2 fatal frame, -1 EOF, 0 no active control, 1 STOP, 3 CANCEL. */
 static int serve_read_cmd(const char *cur_id) {
     char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok, alen = 0; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f %d", &slot, &plen, &max_tok, &temp, &top_p, &alen);
-        /* 6th field (optional, backward compatible): DMel byte count appended
-         * verbatim after the text payload — frames x mel_bins u8 levels */
-        /* SEC: max_tok was the one field nobody validated, and it is the one
-         * the context check is built on. prompt_reject() asks
-         * `np + want > ctx_max`; a negative `want` makes that sum smaller than
-         * np, so the check passes for any prompt length. kv_alloc() is then
-         * sized on the same np + max_tok + 8 and comes out shorter than the
-         * prompt, and prefill writes past the end of the K/V cache -- a heap
-         * overflow whose length and contents both follow from the request.
-         *
-         * The official gateway forces a positive integer, so this is not
-         * reachable through openai_server.py. The SERVE protocol is public and
-         * anything bridging it (socat, a custom gateway, a sidecar) exposes it
-         * directly, so the check belongs here, next to the one plen already
-         * has, rather than in one of its callers. */
-        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26) ||
-            max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        uint8_t *au = NULL;
-        if (alen > 0) {
-            au = malloc((size_t)alen);
-            if (fread(au, 1, (size_t)alen, stdin) != (size_t)alen) { free(pl); free(au); return -1; }
-        }
-        int nl = fgetc(stdin); (void)nl;
-        if (g_qn < SRV_QMAX) {
-            SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-            q->audio = au; q->alen = alen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
+    if (g_input_bad) return -2;
+    if (g_input_closed) return -1;
+    if (!fgets(ln, sizeof(ln), stdin)) {
+        if (ferror(stdin)) return serve_bad_frame(NULL, cur_id);
+        g_input_closed = 1; return -1;
     }
+    if (!strchr(ln, '\n')) return serve_bad_frame(NULL, cur_id);
+    char *fields[9]; int nf = 0;
+    for (char *p = strtok(ln, " \t\r\n\v\f"); p; p = strtok(NULL, " \t\r\n\v\f")) {
+        if (nf == 9) return serve_bad_frame(NULL, cur_id);
+        fields[nf++] = p;
+    }
+    const char *id = nf >= 2 && strlen(fields[1]) < 64 ? fields[1] : NULL;
+    if (!id) return serve_bad_frame(NULL, cur_id);
+    const char *cmd = fields[0];
+    if (!strcmp(cmd, "CANCEL") || !strcmp(cmd, "STOP")) {
+        if (nf != 2) return serve_bad_frame(id, cur_id);
+        int control = !strcmp(cmd, "CANCEL") ? 3 : 1;
+        if (cur_id && !strcmp(id, cur_id)) return control;
+        for (int i = 0; i < g_qn; i++) if (!strcmp(id, g_q[i].id)) {
+            if (control == 1) g_q[i].stop_requested = 1;
+            else {
+                free(g_q[i].payload); free(g_q[i].audio);
+                memmove(g_q + i, g_q + i + 1, (size_t)(--g_qn - i) * sizeof(SReq));
+                serve_emit_terminal(id, 3, 0, 0, 0, 0, 0, 0);
+            }
+            return 0;
+        }
+        printf("ERROR %s NOT_FOUND\n", id); fflush(stdout); return 0;
+    }
+    if (strcmp(cmd, "SUBMIT") || (nf != 7 && nf != 8))
+        return serve_bad_frame(id, cur_id);
+    long long slot, plen, max_tok, alen = 0;
+    char *end;
+    if (!serve_integer(fields[2], &slot) || !serve_integer(fields[3], &plen) ||
+        !serve_integer(fields[4], &max_tok) ||
+        (nf == 8 && !serve_integer(fields[7], &alen)) ||
+        plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26))
+        return serve_bad_frame(id, cur_id);
+    float temp = strtof(fields[5], &end);
+    if (end == fields[5] || *end) return serve_bad_frame(id, cur_id);
+    float top_p = strtof(fields[6], &end);
+    if (end == fields[6] || *end) return serve_bad_frame(id, cur_id);
+    (void)slot;
+    char *pl = malloc((size_t)plen + 1);
+    if (!pl || fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) {
+        free(pl); return serve_bad_frame(id, cur_id);
+    }
+    pl[plen] = 0;
+    uint8_t *au = alen ? malloc((size_t)alen) : NULL;
+    if (alen && (!au || fread(au, 1, (size_t)alen, stdin) != (size_t)alen)) {
+        free(pl); free(au); return serve_bad_frame(id, cur_id);
+    }
+    if (fgetc(stdin) != '\n') { free(pl); free(au); return serve_bad_frame(id, cur_id); }
+    /* Admission follows complete framing, including the 64 MiB DMel extension. */
+    if (max_tok < 1 || max_tok > (1<<20)) {
+        printf("ERROR %s bad submit header\n", id); fflush(stdout); free(pl); free(au); return 0;
+    }
+    if (g_qn < SRV_QMAX) {
+        SReq *q = &g_q[g_qn++];
+        snprintf(q->id, sizeof(q->id), "%s", id);
+        q->max_tok = (int)max_tok; q->temp = temp; q->top_p = top_p;
+        q->payload = pl; q->plen = (int)plen; q->audio = au; q->alen = (int)alen;
+        q->stop_requested = 0;
+    } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
     return 0;
+}
+
+static int serve_poll_controls(const char *active_id) {
+    int control = 0;
+    if (g_input_bad) return -2;
+    while (!g_input_closed && stdin_readable()) {
+        int r = serve_read_cmd(active_id);
+        if (r == -2) { g_input_bad = 1; serve_clear_queue(); return -2; }
+        if (r == 3 || (r == 1 && control != 3)) control = r;
+    }
+    return control ? control : (g_input_closed ? -1 : 0);
 }
 
 static void serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
+    int control = serve_poll_controls(q->id);
+    if (control == 3 || control == -2) {
+        serve_emit_terminal(q->id, control, 0, 0, 0, rss_gb(), 0, 0); return;
+    }
+    if (control != 1) control = q->stop_requested ? 1 : 0;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    if (bad) {
+        int limit = getenv("CTX_MAX") ? atoi(getenv("CTX_MAX")) : 8192;
+        printf("ERROR %s CONTEXT_EXCEEDED %d %d\n", q->id, np + q->max_tok, limit);
+        fflush(stdout); free(ids); return;
+    }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
@@ -1874,6 +1943,12 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
                q->id, naud, audio_tok_count(m, ids, np),
                m->audio_norm ? "" : " — snapshot has no audio tensors");
         fflush(stdout); free(ids); return;
+    }
+    printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
+    int next_control = serve_poll_controls(q->id);
+    if (next_control == -2 || next_control == 3 || next_control == 1) control = next_control;
+    if (control) {
+        serve_emit_terminal(q->id, control, 0, 0, 0, rss_gb(), np, 0); free(ids); return;
     }
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
@@ -1918,13 +1993,15 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     /* `reuse` is the ABSOLUTE position of the first fresh token: attention and
      * the KV slots are position-indexed, so this has to be the real offset. */
     float *logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
-    int len = np, gen = 0, limited = 1, cancelled = 0;
+    int len = np, gen = 0, limited = 1;
+    control = serve_poll_controls(q->id);
+    if (control == -1) control = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
     float rep = getenv("REP_PEN") ? atof(getenv("REP_PEN")) : 1.1f;
     int hist[128], nhist = 0;
     for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
-    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+    for (int s = 0; s < q->max_tok && !control; s++) {
         apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
         free(logit); logit = NULL;
@@ -1936,19 +2013,18 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         fwrite(buf, 1, (size_t)nb, stdout);
         fputc('\n', stdout); fflush(stdout);
         gen++; len++;
-        while (stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
-            if (r > 0) { cancelled = 1; limited = 0; }
-        }
-        if (cancelled || s == q->max_tok - 1) break;
+        control = serve_poll_controls(q->id);
+        if (control == -1) control = 0;
+        if (control || s == q->max_tok - 1) break;
         logit = step(m, &tk, 1, len - 1, NULL);
+        control = serve_poll_controls(q->id);
+        if (control == -1) control = 0;
     }
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    serve_emit_terminal(q->id, control, gen, dt > 0 ? gen/dt : 0.0,
+                        tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
     /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
      * expert_wait -> shared-expert compute, lm_head folded into 0). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
@@ -2034,12 +2110,14 @@ static void serve_loop(Model *m, Tok *T) {
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        if (serve_poll_controls(NULL) == -2) return;
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) { serve_clear_queue(); return; }
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
         serve_one(m, T, &q);
         serve_tiers_emap(m);
         free(q.payload); free(q.audio);
+        if (g_input_bad) { serve_clear_queue(); return; }
     }
 }
 

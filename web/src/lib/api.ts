@@ -123,16 +123,29 @@ export async function getProfile(baseUrl: string, apiKey = "", signal?: AbortSig
   return (await response.json()) as ProfileResponse
 }
 
-export function extractSSE(buffer: string) {
-  const frames = buffer.split(/\r?\n\r?\n/)
-  const rest = frames.pop() || ""
-  const data = frames.flatMap((frame) =>
-    frame
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart()),
-  )
-  return { data, rest }
+export function extractSSE(buffer: string, final = false): { data: string[]; rest: string } {
+  const data: string[] = []
+  let fields: string[] = []
+  let eventStart = 0
+  let lineStart = 0
+  for (let index = 0; index < buffer.length; index++) {
+    const character = buffer[index]
+    if (character !== "\r" && character !== "\n") continue
+    if (character === "\r" && index === buffer.length - 1 && !final) break
+    const line = buffer.slice(lineStart, index)
+    if (character === "\r" && buffer[index + 1] === "\n") index++
+    lineStart = index + 1
+    if (line === "") {
+      const payload = fields.join("\n")
+      if (payload) data.push(payload)
+      fields = []
+      eventStart = lineStart
+    } else if (line === "data" || line.startsWith("data:")) {
+      const value = line.slice(5)
+      fields.push(value.startsWith(" ") ? value.slice(1) : value)
+    }
+  }
+  return { data, rest: buffer.slice(eventStart) }
 }
 
 export interface StreamChatOptions {
@@ -173,34 +186,67 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
 
-  const consume = (data: string) => {
-    if (data === "[DONE]") return
-    const event = JSON.parse(data) as {
-      choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>
-      usage?: TokenUsage | null
+  let transportEnded = false
+  let cancelRequested = false
+  const cancelConsumption = () => {
+    if (transportEnded || cancelRequested) return
+    cancelRequested = true
+    // Some sources never settle cancellation; cleanup must not hold completion open.
+    void reader.cancel().catch(() => undefined)
+  }
+  options.signal.addEventListener("abort", cancelConsumption, { once: true })
+  try {
+    let completed = false
+    while (!completed) {
+      options.signal.throwIfAborted()
+      const { value, done } = await reader.read()
+      transportEnded = done
+      options.signal.throwIfAborted()
+      buffer += decoder.decode(value, { stream: !done })
+      const parsed = extractSSE(buffer, done)
+      buffer = parsed.rest
+      for (const data of parsed.data) {
+        options.signal.throwIfAborted()
+        if (data === "[DONE]") {
+          completed = true
+          break
+        }
+        let event: {
+          error?: { message?: string } | null
+          choices?: Array<{ delta?: { content?: string; tool_calls?: unknown }; finish_reason?: string | null }>
+          usage?: TokenUsage | null
+        }
+        try {
+          event = JSON.parse(data) as typeof event
+          if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error()
+        } catch {
+          throw new Error("The server returned an invalid streaming event.")
+        }
+        if ("error" in event) throw new Error(event.error?.message || "The server reported a streaming error.")
+        const choice = event.choices?.[0]
+        if (choice?.delta?.tool_calls) throw new Error("This text chat does not support tool calls.")
+        const text = choice?.delta?.content
+        if (text) {
+          options.signal.throwIfAborted()
+          options.onDelta(text)
+        }
+        if (choice?.finish_reason) finishReason = choice.finish_reason
+        if (event.usage) usage = event.usage
+      }
+      if (done && !completed) throw new Error("The response stream ended before [DONE].")
     }
-    const choice = event.choices?.[0]
-    const text = choice?.delta?.content
-    if (text) options.onDelta(text)
-    if (choice?.finish_reason) finishReason = choice.finish_reason
-    if (event.usage) usage = event.usage
-  }
-
-  while (true) {
-    const { value, done } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done })
-    const parsed = extractSSE(buffer)
-    buffer = parsed.rest
-    parsed.data.forEach(consume)
-    if (done) break
-  }
-
-  const queueWaitHeader = response.headers.get("x-colibri-queue-wait-ms")
-  const parsedQueueWait = queueWaitHeader === null ? null : Number(queueWaitHeader)
-  return {
-    finishReason,
-    usage,
-    requestId: response.headers.get("x-request-id"),
-    queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
+    options.signal.throwIfAborted()
+    const queueWaitHeader = response.headers.get("x-colibri-queue-wait-ms")
+    const parsedQueueWait = queueWaitHeader === null ? null : Number(queueWaitHeader)
+    return {
+      finishReason,
+      usage,
+      requestId: response.headers.get("x-request-id"),
+      queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
+    }
+  } finally {
+    options.signal.removeEventListener("abort", cancelConsumption)
+    cancelConsumption()
+    reader.releaseLock()
   }
 }

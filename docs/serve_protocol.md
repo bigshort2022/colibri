@@ -72,6 +72,23 @@ Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQU
 `CANCELLED`. A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
 is persisted.
 
+The serial OLMoE, Inkling, Kimi and DeepSeek V4 servers use the same
+request-ID control contract. They emit `ACCEPT <id> <prompt_tokens>` after
+validation and before prefill. Context rejection uses
+`ERROR <id> CONTEXT_EXCEEDED <used> <limit>`. At existing forward/callback
+boundaries, readable controls are drained before more DATA; CANCEL wins over STOP.
+STOP finishes with normal DONE and `length_limited=0`; CANCEL emits only its
+CANCELLED terminal error. EOF closes admission but finishes accepted work.
+OLMoE/Inkling retain FIFO submissions: queued STOP yields an accepted zero-output
+completion when its turn arrives; queued CANCEL removes only that request.
+
+SUBMIT framing is distinct from semantic admission. A fully framed rejected
+request has its payload and bounded optional extension consumed before rejection,
+so prompt bytes cannot become control commands. Invalid lengths, incomplete or
+overlong headers, truncated payloads and bad final delimiters are fatal BAD_FRAME:
+the stream is not resynchronized. Inkling retains its optional audio extension
+and 64 MiB extension ceiling.
+
 Immediately before each `DONE` the engine emits a telemetry block for the finished
 turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats below).
 `.coli_usage` is persisted at every turn end, not only at exit.
@@ -102,6 +119,46 @@ All telemetry is advisory: servers render what they know and skip the rest.
   gpus, entropy, repin}`.
 - `GET /*` — static hosting of `web/dist` (SPA fallback, path-traversal-safe), plus
   `experts.json` if published there (the measured expert atlas, #175/#218).
+
+### Streaming lifecycle and built-in consumers
+
+OpenAI chat/completions and Anthropic messages defer SSE success headers until
+native acceptance. Older engines without ACCEPT are accepted on their first
+DATA/DONE. A live prefill is not cancellation; disconnected peers request native
+CANCEL, and the transaction remains owned until its terminal acknowledgement.
+Callback failures cancel and drain too, without replacing the original failure.
+
+Before acceptance, errors remain HTTP JSON errors. After acceptance, OpenAI
+emits a data event containing an `error` envelope; Anthropic emits a named `error`
+event. Neither error path emits a success terminator or a second HTTP status.
+Keepalive pumps stop and join on success, failure and disconnect. Anthropic block
+indices increase across reopened thinking, text and tool-use blocks; input usage
+comes from ACCEPT or, for older engines, authoritative terminal statistics.
+
+The browser and attached terminal assemble SSE data fields per complete event,
+including multiline/no-space fields, comments and LF/CRLF/CR line endings. They
+require `[DONE]`, stop immediately at that marker even on an open connection,
+and explicitly report server errors, invalid JSON, premature EOF and unsupported
+tool calls. Partial answer text survives interruption; reasoning is not added to
+terminal assistant history. Empty successful replies produce a no-answer
+diagnostic rather than a permanent typing indicator.
+
+Opt-in real-model acceptance attaches only to an explicitly supplied gateway:
+
+```sh
+cd c
+COLI_STREAM_BASE_URL=http://127.0.0.1:18773 \
+COLI_STREAM_MODEL_ID=olmoe-colibri \
+python3.13 -m unittest -v tests.test_streaming_model
+```
+
+Set `COLI_API_KEY` in the environment when authentication is enabled. The suite
+expects an owner-configured `CTX=128` and at least a 64-token generation ceiling.
+It compares JSON/SSE answers and usage on all three endpoints, checks pre-accept
+context rejection, and disconnects mid-generation before checking recovery. It
+does not start/stop a gateway or download/change weights. Normal discovery skips
+when both streaming variables are unset; setting only one is an error.
+
 
 ## Legacy protocol (`run_serve`, `coli chat`)
 

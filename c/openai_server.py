@@ -1124,7 +1124,9 @@ class ThinkingStreamSplit:
                 offset, marker = min(hits, key=lambda hit: hit[0])
                 self._emit(self.buf[:offset])
                 self.buf = self.buf[offset + len(marker):]
-                if marker == THINK_CLOSE and self.thinking:
+                if marker == THINK_OPEN:
+                    self.thinking = True
+                elif self.thinking:
                     self.thinking = False
                     if self.on_thinking_end:
                         self.on_thinking_end()
@@ -1884,62 +1886,88 @@ class Engine:
         cancel_sent = False
         stop_sent = False
         accepted = False
+        terminal = False
+        consumer_error = None
+
+        def control(command):
+            nonlocal cancel_sent, stop_sent
+            if command == "CANCEL":
+                if cancel_sent:
+                    return
+                cancel_sent = True
+            else:
+                if stop_sent or cancel_sent:
+                    return
+                stop_sent = True
+            try:
+                with self.write_lock:
+                    self.process.stdin.write(f"{command} {request_id}\n".encode())
+                    self.process.stdin.flush()
+            except Exception as error:
+                self._fail_pending(error)
+                raise
 
         def _accept(info):
-            # #597: commit exactly once, on the first of ACCEPT / DATA / DONE. A new engine sends
-            # ACCEPT before any output, so on_accept fires before prefill and a preceding
-            # CONTEXT_EXCEEDED never reaches here (it propagates as a 400 with nothing committed).
-            # An older engine that never sends ACCEPT still commits on its first DATA/DONE.
+            # DATA/DONE also imply acceptance for older engines without ACCEPT.
             nonlocal accepted
-            if not accepted:
+            if not accepted and not cancel_sent:
                 accepted = True
                 if on_accept is not None:
                     on_accept(info)
 
-        while True:
-            try:
-                kind, value = events.get(timeout=0.05)
-            except queue.Empty:
-                # #908: cancelled() is only polled in the "data" branch, so a
-                # client that disconnects before the engine's first DATA frame
-                # (it is still prefilling) never cancels: the CANCEL never went
-                # out, the turn ran to its token limit, and this thread stayed
-                # blocked until the engine emitted something. Poll the callback
-                # while idle so a pre-first-frame disconnect cancels too.
-                if not cancel_sent and not stop_sent and cancelled and cancelled():
-                    cancel_sent = True
-                    with self.write_lock:
-                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                        self.process.stdin.flush()
-                continue
-            if kind == "accept":
-                if accepted:
-                    raise RuntimeError("engine sent a duplicate ACCEPT frame")
-                _accept(value)
-            elif kind == "data":
-                _accept({"prompt_tokens": None})
-                if not cancel_sent and not stop_sent:
-                    decode(value)
-                    if stopped and stopped():
-                        stop_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"STOP {request_id}\n".encode())
-                            self.process.stdin.flush()
-                    elif cancelled and cancelled():
-                        cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
-            elif kind == "done":
-                _accept({"prompt_tokens": None})
-                tail = decoder.decode(b"", final=True)
-                if tail:
-                    on_text(tail)
-                return value
-            elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
-                raise ClientCancelled()
-            else:
-                raise value
+        try:
+            while True:
+                try:
+                    try:
+                        kind, value = events.get(timeout=0.05)
+                    except queue.Empty:
+                        if consumer_error is None and not cancel_sent and cancelled and cancelled():
+                            control("CANCEL")
+                        continue
+                    terminal = kind in ("done", "error")
+                    if consumer_error is not None:
+                        if terminal:
+                            raise consumer_error
+                        continue
+                    if kind == "accept":
+                        if not cancel_sent:
+                            if accepted:
+                                raise RuntimeError("engine sent a duplicate ACCEPT frame")
+                            _accept(value)
+                    elif kind == "data":
+                        if not cancel_sent and not stop_sent:
+                            _accept({"prompt_tokens": None})
+                            decode(value)
+                            if cancelled and cancelled():
+                                control("CANCEL")
+                            elif stopped and stopped():
+                                control("STOP")
+                    elif kind == "done":
+                        if cancel_sent:
+                            raise ClientCancelled()
+                        _accept({"prompt_tokens": None})
+                        if not stop_sent:
+                            tail = decoder.decode(b"", final=True)
+                            if tail:
+                                on_text(tail)
+                        return value
+                    elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
+                        raise ClientCancelled()
+                    else:
+                        raise value
+                except BaseException as error:
+                    if terminal:
+                        raise consumer_error if consumer_error is not None else error
+                    if consumer_error is None:
+                        consumer_error = error
+                    try:
+                        control("CANCEL")
+                    except Exception:
+                        # A failed pipe resolves pending queues; preserve the original failure.
+                        raise consumer_error
+        finally:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
 
     def close(self):
         with self.pending_lock:
@@ -2126,6 +2154,7 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
+        self._stream_error = None
         # Fresh budget per request: a keep-alive connection may serve many, and
         # each is entitled to its own read window -- but none may drip forever.
         self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
@@ -2447,11 +2476,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def _fail(self, error, request_id):
-        """Report an error, unless the response is already on the wire. Once a streaming 200
-        is committed, a second status line would be framed as SSE body -- clients saw a whole
-        `HTTP/1.1 500` spliced into the event stream. All we can still do is stop talking; the
-        stream ends at the close, which the 200 already announced (#597 item 3)."""
+        """Report JSON before commitment, or one protocol error in a committed SSE stream."""
         if self._committed:
+            if self._stream_error is not None:
+                try:
+                    self._stream_error(error)
+                except OSError:
+                    pass
             self.close_connection = True
             return
         self.send_json(error.status, self.error_body(error), request_id, error.headers)
@@ -2561,6 +2592,9 @@ class APIHandler(BaseHTTPRequestHandler):
             connected = False
             stream_started = [False]
             ka_thread = [None]
+
+            def stream_cancelled():
+                return (stream_started[0] and not connected) or self.client_disconnected()
             # KEEPALIVE: engine.generate() blocks SILENTLY during the (minutes-long) cold
             # prefill, and the client drops the socket after its idle timeout. A background pump
             # emits a keepalive delta whenever no event has been written for KA_GAP seconds. All
@@ -2572,7 +2606,7 @@ class APIHandler(BaseHTTPRequestHandler):
             KA_GAP = 10.0
             dbg_echo = dbg >= 1   # tee decoded tokens to stderr (COLI_DEBUG level parsed in generation())
 
-            def event(choices, usage_marker=False):
+            def event(choices, usage_marker=False, keepalive=False):
                 nonlocal connected
                 if not connected:
                     return
@@ -2582,6 +2616,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     event_body["usage"] = None if not usage_marker else usage_marker
                 data = json.dumps(event_body, ensure_ascii=False, separators=(",", ":"))
                 with ka_lock:
+                    if not connected or (keepalive and ka_stop.is_set()):
+                        return
                     try:
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
@@ -2595,15 +2631,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 # cold prefill. COLI_VISIBLE_KEEPALIVE=1 restores the old visible "." for
                 # diagnosing whether keepalives are being delivered at all.
                 visible = os.environ.get("COLI_VISIBLE_KEEPALIVE") == "1"
-                ping = [{"index": 0,
-                         "delta": ({"reasoning_content": "." if visible else ""} if chat
-                                   else {"content": ""}),
-                         "logprobs": None, "finish_reason": None}]
+                ping = ([{"index": 0, "delta": {"reasoning_content": "." if visible else ""},
+                          "logprobs": None, "finish_reason": None}] if chat else
+                        [{"index": 0, "text": "", "logprobs": None, "finish_reason": None}])
                 while not ka_stop.wait(1.0):
                     if not connected:
                         return
                     if time.time() - last_write[0] >= KA_GAP:
-                        event(ping)
+                        event(ping, keepalive=True)
 
             def emit(text):
                 choice = ({"index": 0, "delta": {"content": text}, "logprobs": None,
@@ -2646,87 +2681,96 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_cors_headers()
                 self.end_headers()
                 connected = True
+                def stream_error(error):
+                    nonlocal connected
+                    with ka_lock:
+                        if connected:
+                            try:
+                                data = json.dumps(error_object(error), ensure_ascii=False,
+                                                  separators=(",", ":"))
+                                self.wfile.write(f"data: {data}\n\n".encode())
+                                self.wfile.flush()
+                            except OSError:
+                                connected = False
+                self._stream_error = stream_error
                 last_write[0] = time.time()
                 if chat:
                     event([{"index": 0, "delta": {"role": "assistant", "content": ""},
                             "logprobs": None, "finish_reason": None}])
                 ka_thread[0] = threading.Thread(target=_keepalive, daemon=True)
                 ka_thread[0].start()
-            if chat and tools:
-                # Suppress tool-call markers from the streamed content and parse the authoritative
-                # calls from the FULL reply after generation. Hold back a marker-length tail so a
-                # tool-call marker split across engine chunks is still caught.
-                sp = {"buf": "", "tool": False}
-                hold = _tool_hold()
-                raw = []
-                def feed_content(chunk):               # answer text only (post-</think>)
-                    raw.append(chunk)
-                    if sp["tool"]:
-                        return
-                    sp["buf"] += chunk
-                    cut = _tool_cut(sp["buf"])
-                    if cut >= 0:
-                        if cut:
-                            emit(sp["buf"][:cut])
-                        sp["buf"] = ""
-                        sp["tool"] = True
-                        return
-                    flush = max(0, len(sp["buf"]) - hold)
-                    if flush:
-                        emit(sp["buf"][:flush])
-                        sp["buf"] = sp["buf"][flush:]
-                # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
-                # to reasoning_content and passes only the answer text on to feed_content/parser.
-                think = (ThinkingStreamSplit(emit_reasoning, feed_content,
-                                             initial_thinking=enable_thinking)
-                         if glm_think else None)
-                def emit_tools(chunk):
-                    if dbg_echo:
-                        sys.stderr.write(chunk); sys.stderr.flush()
-                    (think.feed if think else feed_content)(chunk)
-                stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
-                stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
-                stop_filter.finish()
-                if think:
-                    think.finish()
-                if not sp["tool"] and sp["buf"]:
-                    emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_arch_tool_calls("".join(raw), tools)
-                for i, tc in enumerate(calls):
-                    event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
-                             "type": "function", "function": {"name": tc["function"]["name"],
-                             "arguments": tc["function"]["arguments"]}}]},
-                            "logprobs": None, "finish_reason": None}])
-                finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
-            else:
-                if splitter is not None:                   # inkling content/marker splitter
-                    content_split = splitter
-                elif glm_think:                            # GLM <think> reasoning → reasoning_content
-                    content_split = ThinkingStreamSplit(emit_reasoning, emit,
-                                                        initial_thinking=enable_thinking)
+            try:
+                if chat and tools:
+                    # Hold back marker-length tails; parse calls from the authoritative reply.
+                    sp = {"buf": "", "tool": False}
+                    hold = _tool_hold()
+                    raw = []
+                    def feed_content(chunk):
+                        raw.append(chunk)
+                        if sp["tool"]:
+                            return
+                        sp["buf"] += chunk
+                        cut = _tool_cut(sp["buf"])
+                        if cut >= 0:
+                            if cut:
+                                emit(sp["buf"][:cut])
+                            sp["buf"] = ""
+                            sp["tool"] = True
+                            return
+                        flush = max(0, len(sp["buf"]) - hold)
+                        if flush:
+                            emit(sp["buf"][:flush])
+                            sp["buf"] = sp["buf"][flush:]
+                    think = (ThinkingStreamSplit(emit_reasoning, feed_content,
+                                                 initial_thinking=enable_thinking)
+                             if glm_think else None)
+                    def emit_tools(chunk):
+                        if dbg_echo:
+                            sys.stderr.write(chunk); sys.stderr.flush()
+                        (think.feed if think else feed_content)(chunk)
+                    stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
+                    stats = self.server.engine.generate(
+                        prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                        stream_cancelled, grammar=grammar, stopped=stop_filter.stopped,
+                        on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    stop_filter.finish()
+                    if think:
+                        think.finish()
+                    if not sp["tool"] and sp["buf"]:
+                        emit(sp["buf"])
+                    _content, calls = parse_arch_tool_calls("".join(raw), tools)
+                    for i, tc in enumerate(calls):
+                        event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
+                                 "type": "function", "function": {"name": tc["function"]["name"],
+                                 "arguments": tc["function"]["arguments"]}}]},
+                                "logprobs": None, "finish_reason": None}])
+                    finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
                 else:
-                    content_split = None
-                def emit_plain(chunk):
-                    if dbg_echo:
-                        sys.stderr.write(chunk); sys.stderr.flush()
-                    (content_split.feed if content_split else emit)(chunk)
-                stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
-                stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
-                stop_filter.finish()
-                if content_split:
-                    content_split.close()
-                finish = "length" if stats["length_limited"] else "stop"
-            # generate() returned, so the prompt was ACCEPTed and start_stream() ran; guard anyway.
-            start_stream()
-            ka_stop.set()                          # generation done: stop the keepalive pump
-            if ka_thread[0] is not None:
-                ka_thread[0].join(timeout=2)
+                    if splitter is not None:
+                        content_split = splitter
+                    elif glm_think:
+                        content_split = ThinkingStreamSplit(emit_reasoning, emit,
+                                                            initial_thinking=enable_thinking)
+                    else:
+                        content_split = None
+                    def emit_plain(chunk):
+                        if dbg_echo:
+                            sys.stderr.write(chunk); sys.stderr.flush()
+                        (content_split.feed if content_split else emit)(chunk)
+                    stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
+                    stats = self.server.engine.generate(
+                        prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                        stream_cancelled, grammar=grammar, stopped=stop_filter.stopped,
+                        on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    stop_filter.finish()
+                    if content_split:
+                        content_split.close()
+                    finish = "length" if stats["length_limited"] else "stop"
+                start_stream()
+            finally:
+                ka_stop.set()
+                if ka_thread[0] is not None:
+                    ka_thread[0].join()
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,
                                           "finish_reason": finish})
@@ -2900,27 +2944,23 @@ class APIHandler(BaseHTTPRequestHandler):
                     request_id, queue_headers)
                 return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Connection", "close")   # see the OpenAI path: SSE is close-framed
-            self.close_connection = True
-            self.send_header("x-request-id", request_id)
-            for name, value in queue_headers.items():
-                self.send_header(name, value)
-            self.send_cors_headers()
-            self.end_headers()
-            connected = [True]
+            connected = [False]
+            stream_started = [False]
+            ka_thread = [None]
+
+            def stream_cancelled():
+                return (stream_started[0] and not connected[0]) or self.client_disconnected()
             write_lock = threading.Lock()
             last_write = [time.time()]
             ka_stop = threading.Event()
 
-            def send_event(name, payload):
+            def send_event(name, payload, keepalive=False):
                 if not connected[0]:
                     return
                 data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                 with write_lock:
+                    if not connected[0] or (keepalive and ka_stop.is_set()):
+                        return
                     try:
                         self.wfile.write(f"event: {name}\ndata: {data}\n\n".encode())
                         self.wfile.flush()
@@ -2935,23 +2975,61 @@ class APIHandler(BaseHTTPRequestHandler):
                     if not connected[0]:
                         return
                     if time.time() - last_write[0] >= 10.0:
-                        send_event("ping", {"type": "ping"})
+                        send_event("ping", {"type": "ping"}, keepalive=True)
 
-            send_event("message_start", {"type": "message_start", "message": {
-                "id": message_id, "type": "message", "role": "assistant",
-                "model": self.server.model_id, "content": [], "stop_reason": None,
-                "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
-            text_index = 1 if enable_thinking else 0
-            stream_state = {"thinking_closed": not enable_thinking,
-                            "text_started": not enable_thinking}
-            if enable_thinking:
-                send_event("content_block_start", {"type": "content_block_start", "index": 0,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
-            else:
-                send_event("content_block_start", {"type": "content_block_start", "index": 0,
-                                                   "content_block": {"type": "text", "text": ""}})
-            ka_thread = threading.Thread(target=keepalive, daemon=True)
-            ka_thread.start()
+            def start_stream(accept_info=None):
+                if stream_started[0]:
+                    return
+                stream_started[0] = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                self.send_header("x-request-id", request_id)
+                for name, value in queue_headers.items():
+                    self.send_header(name, value)
+                self.send_cors_headers()
+                self.end_headers()
+                connected[0] = True
+                self._stream_error = lambda error: send_event("error", self.error_body(error))
+                count = (accept_info or {}).get("prompt_tokens") or 0
+                send_event("message_start", {"type": "message_start", "message": {
+                    "id": message_id, "type": "message", "role": "assistant",
+                    "model": self.server.model_id, "content": [], "stop_reason": None,
+                    "stop_sequence": None, "usage": {"input_tokens": count, "output_tokens": 0}}})
+                ka_thread[0] = threading.Thread(target=keepalive, daemon=True)
+                ka_thread[0].start()
+
+            active_block = None
+            next_block_index = 0
+
+            def end_block():
+                nonlocal active_block
+                if active_block is None:
+                    return
+                kind, index = active_block
+                if kind == "thinking":
+                    send_event("content_block_delta", {"type": "content_block_delta",
+                        "index": index, "delta": {"type": "signature_delta",
+                                                 "signature": ANTHROPIC_LOCAL_SIGNATURE}})
+                send_event("content_block_stop", {"type": "content_block_stop", "index": index})
+                active_block = None
+
+            def begin_block(kind):
+                nonlocal active_block, next_block_index
+                if active_block is not None and active_block[0] == kind:
+                    return active_block[1]
+                end_block()
+                index = next_block_index
+                next_block_index += 1
+                active_block = (kind, index)
+                block = ({"type": "thinking", "thinking": "", "signature": ""} if kind == "thinking"
+                         else {"type": "text", "text": ""})
+                send_event("content_block_start", {"type": "content_block_start",
+                                                   "index": index, "content_block": block})
+                return index
 
             raw = []
             state = {"buf": "", "in_tool": False}
@@ -2960,12 +3038,9 @@ class APIHandler(BaseHTTPRequestHandler):
             def emit_text(chunk):
                 if not chunk:
                     return
-                if not stream_state["text_started"]:
-                    stream_state["text_started"] = True
-                    send_event("content_block_start", {"type": "content_block_start",
-                        "index": text_index, "content_block": {"type": "text", "text": ""}})
+                index = begin_block("text")
                 send_event("content_block_delta", {"type": "content_block_delta",
-                    "index": text_index, "delta": {"type": "text_delta", "text": chunk}})
+                    "index": index, "delta": {"type": "text_delta", "text": chunk}})
 
             def emit_answer(chunk):
                 if not tools:
@@ -2987,17 +3062,18 @@ class APIHandler(BaseHTTPRequestHandler):
                     state["buf"] = state["buf"][flush:]
 
             def emit_thinking(chunk):
-                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                if not chunk:
+                    return
+                if tools and not state["in_tool"] and state["buf"]:
+                    emit_text(state["buf"])
+                    state["buf"] = ""
+                index = begin_block("thinking")
+                send_event("content_block_delta", {"type": "content_block_delta", "index": index,
                     "delta": {"type": "thinking_delta", "thinking": chunk}})
 
             def close_thinking():
-                if stream_state["thinking_closed"]:
-                    return
-                stream_state["thinking_closed"] = True
-                send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                    "delta": {"type": "signature_delta",
-                              "signature": ANTHROPIC_LOCAL_SIGNATURE}})
-                send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                if active_block is not None and active_block[0] == "thinking":
+                    end_block()
 
             if ARCH == "inkling":
                 split = InklingStreamSplit(emit_answer,
@@ -3008,27 +3084,30 @@ class APIHandler(BaseHTTPRequestHandler):
                          if enable_thinking else None)
 
             def on_text(chunk):
+                start_stream()
                 raw.append(chunk)
                 (split.feed if split else emit_answer)(chunk)
 
-            stop_filter = StopFilter(stop_sequences, on_text, ignore_leading_stop)
-            stats = self.server.engine.generate(
-                prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
-            stop_filter.finish()
-            if split:
-                split.close()
-                close_thinking()               # budget exhaustion before </think>
-            if tools and not state["in_tool"] and state["buf"]:
-                emit_text(state["buf"])
-            ka_stop.set()
-            ka_thread.join(timeout=2)
-            if stream_state["text_started"]:
-                send_event("content_block_stop", {"type": "content_block_stop",
-                                                  "index": text_index})
+            try:
+                stop_filter = StopFilter(stop_sequences, on_text, ignore_leading_stop)
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    stream_cancelled, grammar=grammar, stopped=stop_filter.stopped,
+                    on_accept=start_stream)
+                stop_filter.finish()
+                start_stream()
+                if split:
+                    split.close()
+                if tools and not state["in_tool"] and state["buf"]:
+                    emit_text(state["buf"])
+            finally:
+                ka_stop.set()
+                if ka_thread[0] is not None:
+                    ka_thread[0].join()
+            end_block()
 
             content, stop_reason = blocks_and_stop("".join(raw), stats)
-            index = text_index + 1 if stream_state["text_started"] else 1
+            index = next_block_index
             for block in content:
                 if block["type"] != "tool_use":
                     continue                     # thinking/text blocks were streamed above
@@ -3042,7 +3121,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 index += 1
             send_event("message_delta", {"type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": stats["completion_tokens"]}})
+                "usage": {"input_tokens": stats["prompt_tokens"],
+                          "output_tokens": stats["completion_tokens"]}})
             send_event("message_stop", {"type": "message_stop"})
             # close_connection was already set when the 200 was committed (#597 item 3).
 

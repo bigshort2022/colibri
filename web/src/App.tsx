@@ -79,6 +79,7 @@ export default function App() {
   const [error, setError] = useState("")
   const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
+  const activeAssistantRef = useRef<string | null>(null)
   const probeRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const messages = conversations[cacheSlot] || []
@@ -177,12 +178,16 @@ export default function App() {
 
   const send = async () => {
     const content = draft.trim()
-    if (!content || loading) return
+    if (!content || loading || abortRef.current) return
     const user = message("user", content)
     const assistant = message("assistant", "")
     const history = [...messages, user]
+    const controller = new AbortController()
+    abortRef.current = controller
+    activeAssistantRef.current = assistant.id
     setDraft("")
     setError("")
+    setLastRun(null)
     updateMessages([...history, assistant])
     setLoading(true)
     setStreamStart(null)
@@ -192,8 +197,7 @@ export default function App() {
     const t0 = performance.now()
     let firstToken = true
     let count = 0
-    const controller = new AbortController()
-    abortRef.current = controller
+    let answer = ""
     try {
       const result = await streamChat({
         baseUrl,
@@ -206,6 +210,8 @@ export default function App() {
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
         onDelta: (delta) => {
+          if (abortRef.current !== controller || controller.signal.aborted) return
+          answer += delta
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); firstToken = false }
           count++
           setTokenCount(count)
@@ -216,6 +222,7 @@ export default function App() {
           ))
         },
       })
+      if (abortRef.current !== controller || controller.signal.aborted) return
       const finalElapsed = (performance.now() - t0) / 1000
       if (count > 0 && finalElapsed > 0) setTokPerSec(count / finalElapsed)
       if (result.usage) setTotalTokens(prev => ({
@@ -224,16 +231,22 @@ export default function App() {
       }))
       setLastRun(result)
       setConnected(true)
+      if (!answer) {
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id))
+        setError("The server returned no answer content.")
+      }
     } catch (cause) {
-      if (controller.signal.aborted) {
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
-      } else {
+      if (abortRef.current !== controller) return
+      if (!controller.signal.aborted) {
         setError(cause instanceof Error ? cause.message : "status.generationFailed")
-        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
       }
     } finally {
-      abortRef.current = null
-      setLoading(false)
+      if (abortRef.current === controller) {
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
+        abortRef.current = null
+        activeAssistantRef.current = null
+        setLoading(false)
+      }
     }
   }
 
@@ -334,7 +347,7 @@ export default function App() {
               {!loading && lastRun?.finishReason === "length" ? <Badge className="badge-warn" title={t("topbar.truncatedHelp")}><AlertTriangle className="size-3" /> {t("topbar.truncated")}</Badge> : null}
               {lastRun?.queueWaitMs != null ? <Badge><Clock className="size-3" /> queue {Math.round(lastRun.queueWaitMs)}ms</Badge> : null}
               <Badge><MonitorDot className="size-3" /> {t("topbar.slot", { n: cacheSlot + 1 })}</Badge>
-              <Button variant="ghost" size="sm" onClick={() => { updateMessages([]); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({prompt:0,completion:0}) }} disabled={!messages.length || loading}><Trash2 className="size-3.5" /> {t("topbar.clear")}</Button>
+              <Button variant="ghost" size="sm" onClick={() => { updateMessages([]); setLastRun(null); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({prompt:0,completion:0}) }} disabled={!messages.length || loading}><Trash2 className="size-3.5" /> {t("topbar.clear")}</Button>
             </div>
         </header>
 
@@ -364,7 +377,7 @@ export default function App() {
                            model's output is markdown. */
                         ? <Markdown source={item.content} />
                         : item.content)
-                    : <span className="typing" aria-label="Generating"><i /><i /><i /></span>}</div></div>
+                    : loading && item.id === activeAssistantRef.current ? <span className="typing" aria-label="Generating"><i /><i /><i /></span> : null}</div></div>
                 </article>
               ))}
               <div ref={bottomRef} />

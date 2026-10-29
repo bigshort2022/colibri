@@ -993,6 +993,35 @@ def server_probe(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+def _sse_data_events(response):
+    """Yield complete SSE data events without waiting for transport closure."""
+    decoder=codecs.getincrementaldecoder("utf-8")("replace")
+    line=[]; fields=[]; skip_lf=False
+    while True:
+        # HTTPResponse.read() can wait for its entire requested size. read1()
+        # returns the bytes available now, including DONE on a live connection.
+        chunk=response.read1(4096)
+        text=decoder.decode(chunk, final=not chunk)
+        for char in text:
+            if skip_lf:
+                skip_lf=False
+                if char=="\n": continue
+            if char not in "\r\n":
+                line.append(char); continue
+            skip_lf=char=="\r"
+            value="".join(line); line=[]
+            if not value:
+                payload="\n".join(fields); fields=[]
+                if payload: yield payload
+            elif value.startswith("data:"):
+                value=value[5:]
+                if value.startswith(" "): value=value[1:]
+                fields.append(value)
+        if not chunk:
+            # A transport EOF does not supply the blank line that commits an
+            # incomplete event. The caller must still require a complete DONE.
+            return
+
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
 
@@ -1003,7 +1032,7 @@ def chat_attached(a, base, model_id):
     its KV slots reuse the conversation prefix, so a continued chat skips
     re-prefill too. The engine byte-protocol stays untouched — this is plain
     OpenAI SSE over localhost, stdlib only."""
-    import urllib.request, urllib.error
+    import urllib.request, urllib.error, http.client
     print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
     msgs=[]
@@ -1030,71 +1059,89 @@ def chat_attached(a, base, model_id):
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
-        md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
+        md=MDStream("  "); reply=[]; first=True; t0=time.time(); think_open=False
+        failure=None; done=False
         try:
             with urllib.request.urlopen(req) as r:
-                for raw in r:
-                    line=raw.decode("utf-8","replace").strip()
-                    if not line.startswith("data: "): continue
-                    data=line[6:]
-                    if data=="[DONE]": break
-                    try: ev=json.loads(data)
-                    except ValueError: continue
-                    for ch in ev.get("choices",[]):
-                        d=ch.get("delta",{})
+                for data in _sse_data_events(r):
+                    if data=="[DONE]":
+                        done=True; break
+                    try:
+                        ev=json.loads(data)
+                    except ValueError:
+                        raise ValueError("The server returned an invalid streaming event.") from None
+                    if not isinstance(ev,dict):
+                        raise ValueError("The server returned an invalid streaming event.")
+                    if "error" in ev:
+                        error=ev["error"]
+                        detail=error.get("message") if isinstance(error,dict) else None
+                        raise ValueError(detail or "The server reported a streaming error.")
+                    choices=ev.get("choices",[])
+                    if not isinstance(choices,list):
+                        raise ValueError("The server returned an invalid streaming event.")
+                    for ch in choices:
+                        d=ch.get("delta",{}) if isinstance(ch,dict) else None
+                        if not isinstance(d,dict):
+                            raise ValueError("The server returned an invalid streaming event.")
+                        if d.get("tool_calls"):
+                            raise ValueError("This text chat does not support tool calls.")
                         rtxt=d.get("reasoning_content")
-                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
-                            continue              # thinking nascosto: lo spinner resta a girare
-                        if rtxt:
-                            # Thinking arrives as its own delta field, and this loop
-                            # used to drop it on the floor: `coli run` streamed the
-                            # model's reasoning while `coli chat` silently hid it
-                            # (#979). Render it dim and unformatted — it is the
-                            # model's scratchpad, not the answer — and keep it out
-                            # of the saved reply so history carries content only.
-                            # The keepalive ping reuses this field with "."/"" —
-                            # dim dots read as heartbeat, which is what they are.
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")!="0":
+                            # Reasoning is presentation only, never conversation
+                            # history. The same delta may also carry an answer.
                             if first: sp.stop(); first=False
                             if not think_open:
                                 think_open=True
                                 sys.stdout.write(f"  {C.dgray}┌ thinking{C.r}\n  {C.dgray}│{C.r} ")
                             sys.stdout.write(C.dim+rtxt.replace("\n","\n  "+C.dgray+"│"+C.r+" "+C.dim)+C.r)
-                            sys.stdout.flush(); continue
+                            sys.stdout.flush()
                         txt=d.get("content")
-                        if not txt: continue          # ping/ruolo: non è testo
+                        if not txt: continue
                         if think_open:
                             think_open=False
                             sys.stdout.write(f"{C.r}\n  {C.dgray}└─{C.r}\n")
                         if first: sp.stop(); first=False
-                        md.feed(txt); reply.append(txt)
+                        reply.append(txt); md.feed(txt)
+                if not done:
+                    raise ValueError("The response stream ended before [DONE].")
+                if not reply:
+                    failure="The server returned no answer content."
         except KeyboardInterrupt:
-            interrupted=True                          # il server annulla la richiesta alla disconnessione
+            failure="⏹ interrupted"
         except urllib.error.HTTPError as e:
             # HTTPError IS-A OSError: without this arm a 4xx/5xx fell into the
             # branch below and read as "server unreachable" — hiding the API's
             # own explanation of what was wrong with the request (#975: a V4
             # CONTEXT_EXCEEDED 400 took a screenshot to diagnose instead of a
             # sentence). The body is OpenAI-shaped; show its message.
-            sp.stop()
+            # All presentation cleanup belongs to the finally below.
             try:
                 detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
             except Exception:
                 detail=""
-            print(f"\n  {C.yel}[the server rejected the request: HTTP {e.code}"
-                  f"{' — '+detail if detail else ''}]{C.r}")
-            msgs.pop(); continue                      # la richiesta non è mai partita: togli il turno e riprova
+            finally:
+                e.close()
+            failure=(f"the server rejected the request: HTTP {e.code}"
+                     f"{' — '+detail if detail else ''}")
+        except http.client.HTTPException:
+            failure="The response stream ended before [DONE]."
         except OSError as e:
+            failure=f"server unreachable: {e}"
+        except ValueError as e:
+            failure=str(e)
+        finally:
             sp.stop()
-            print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
-        if think_open:                            # stream finito dentro il thinking (interrupt o
-            think_open=False                      # risposta solo-reasoning): chiudi il riquadro
-            sys.stdout.write(f"{C.r}\n  {C.dgray}\u2514\u2500{C.r}\n")
-        md.close(); sp.stop()
+            if think_open:
+                think_open=False
+                sys.stdout.write(f"{C.r}\n  {C.dgray}└─{C.r}\n")
+            md.close()
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
-        else: msgs.pop()                              # turno vuoto: non sporcare la history
-        el=time.time()-t0
-        note=" · ⏹ interrupted" if interrupted else ""
-        print(f"\r  {C.dgray}└─ ~{len(''.join(reply))//4} tok · {el:.0f}s{note}{C.r}\n")
+        else: msgs.pop()
+        if failure:
+            print(f"\n  {C.yel}[{failure}]{C.r}\n")
+        else:
+            el=time.time()-t0
+            print(f"\r  {C.dgray}└─ ~{len(''.join(reply))//4} tok · {el:.0f}s{C.r}\n")
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):

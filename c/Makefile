@@ -382,13 +382,13 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # test_uring is Linux-only. V4 engine tests are appended below only on supported
 # x86-64 Linux/Windows and aarch64 Linux hosts; the V4 infrastructure tests have
 # unconditional rules and therefore remain portable gates.
-TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_control
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE)
+TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) tests/test_v4_serve_control$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
@@ -893,6 +893,12 @@ tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_qu
 
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
+V4_SERVE_CONTROL_OBJS = $(addsuffix .o,$(filter-out COLI_V4_UNIT_GENERATE_STATS,$(V4_TARGET_UNITS)))
+
+tests/test_v4_serve_control$(EXE): tests/test_v4_serve_control.c deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $(V4_SERVE_CONTROL_OBJS)
+	$(CC) $(NOCUDA_CFLAGS) $< $(V4_SERVE_CONTROL_OBJS) -o $@ -pthread $(NOCUDA_LDFLAGS)
+
 V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_ST.o \
 	COLI_V4_UNIT_CONFIG.o \
@@ -1123,3 +1129,12 @@ tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
+
+tests/test_kimi_serve_control$(EXE): tests/test_kimi_serve_control.c kimi_k3.c kv_prefix.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(filter-out -DCOLI_METAL -DCOLI_VULKAN,$(NOCUDA_CFLAGS)) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_serve_control$(EXE): tests/test_olmoe_serve_control.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
+	$(CC) $(filter-out -DCOLI_METAL,$(NOCUDA_CFLAGS)) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_inkling_serve_control$(EXE): tests/test_inkling_serve_control.c inkling.c st.h json.h compat.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h kv_prefix.h
+	$(CC) $(filter-out -DCOLI_METAL,$(NOCUDA_CFLAGS)) $< -o $@ $(NOCUDA_LDFLAGS)

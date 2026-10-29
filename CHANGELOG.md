@@ -3,6 +3,30 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- OLMoE, Inkling, Kimi and DeepSeek V4 now distinguish STOP, CANCEL, input EOF and
+  fatal framing. OLMoE/Inkling accept before prefill and preserve queued control
+  ownership; rejected frames cannot execute prompt bytes as controls. Native
+  production-source regressions cover each engine, with opt-in checkpoint-backed
+  HTTP acceptance for JSON/SSE parity, context errors and disconnect recovery.
+- Streaming HTTP commitment is separate from peer liveness: a connected request
+  waiting for native acceptance is no longer cancelled. Both chat protocols defer
+  success headers until acceptance, report later failures in-band, and stop their
+  keepalive pumps on every exit.
+- Failed stream callbacks cancel and drain their native transaction before the
+  scheduler releases ownership. Cancelled or stopped transactions cannot deliver
+  trailing decoder bytes; reopened thinking gets fresh Anthropic block indices.
+- Browser and attached terminal chat assemble complete SSE events across UTF-8 and
+  line-ending boundaries, stop at `[DONE]` without waiting for the connection to
+  close, and report interrupted streams, server errors and unsupported tool output.
+  Reasoning no longer hides answer text carried in the same terminal delta.
+- Dashboard Stop/error preserves partial answers without leaving empty assistants
+  or typing indicators behind. Empty successful replies report no answer content;
+  starting a new request and Clear discard stale run metadata.
+
 ## [1.1.1] — 2026-07-23
 
 A same-day patch release. **Windows users on v1.1.0 should upgrade**: Microsoft

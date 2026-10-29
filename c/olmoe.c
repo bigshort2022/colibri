@@ -1110,7 +1110,7 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
 
 /* ---------- serve mode: openai_server.py engine protocol ----------
  * stdin:  SUBMIT <id> <slot> <len> <max_tokens> <temp> <top_p>\n<payload>\n
- *         CANCEL <id>\n
+ *         STOP <id>\n or CANCEL <id>\n
  * stdout: READY sentinel once loaded, then per request a stream of
  *         DATA <id> <size>\n<bytes>\n frames and a final
  *         DONE <id> STAT <tok> <tps> <hit%> <rss> <prompt_tok> <len_limited>\n
@@ -1129,55 +1129,152 @@ static void run_chat(Model *m, Tok *T, int ctx_cap) {
  * never touched, the same invariant CHAT mode's /reset already relies on
  * (it clears hist_len, not the K/V buffers themselves). */
 
-typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen; } SReq;
+typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
+                 int stop_requested; } SReq;
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static int g_input_closed, g_input_bad;
 
-/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
- * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+static void serve_clear_queue(void) {
+    for (int i = 0; i < g_qn; i++) free(g_q[i].payload);
+    g_qn = 0;
+}
+
+static void serve_emit_terminal(const char *id, int control, int emitted, double tps,
+                                double hit, double rss, int prompt_tokens, int length_limited) {
+    if (control == 3) printf("ERROR %s CANCELLED\n", id);
+    else if (control == -2) printf("ERROR %s BAD_FRAME\n", id);
+    else printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", id, emitted,
+                tps, hit, rss, prompt_tokens, control == 1 ? 0 : length_limited);
+    fflush(stdout);
+}
+
+static int serve_bad_frame(const char *id, const char *active_id) {
+    g_input_bad = g_input_closed = 1;
+    serve_clear_queue();
+    if (id && (!active_id || strcmp(id, active_id)))
+        serve_emit_terminal(id, -2, 0, 0, 0, 0, 0, 0);
+    return -2;
+}
+
+static int serve_integer(const char *s, long long *value) {
+    char *end; errno = 0; *value = strtoll(s, &end, 10);
+    return end != s && !*end && errno != ERANGE;
+}
+
+/* -2 fatal frame, -1 EOF, 0 no active control, 1 STOP, 3 CANCEL. */
 static int serve_read_cmd(const char *cur_id) {
     char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p);
-        if (nf < 5 || plen < 0 || plen > (1<<22) || max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        int nl = fgetc(stdin); (void)nl;
-        if (g_qn < SRV_QMAX) {
-            SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+    if (g_input_bad) return -2;
+    if (g_input_closed) return -1;
+    if (!fgets(ln, sizeof(ln), stdin)) {
+        if (ferror(stdin)) return serve_bad_frame(NULL, cur_id);
+        g_input_closed = 1; return -1;
     }
+    if (!strchr(ln, '\n')) return serve_bad_frame(NULL, cur_id);
+    char *fields[9]; int nf = 0;
+    for (char *p = strtok(ln, " \t\r\n\v\f"); p; p = strtok(NULL, " \t\r\n\v\f")) {
+        if (nf == 9) return serve_bad_frame(NULL, cur_id);
+        fields[nf++] = p;
+    }
+    const char *id = nf >= 2 && strlen(fields[1]) < 64 ? fields[1] : NULL;
+    if (!id) return serve_bad_frame(NULL, cur_id);
+    const char *cmd = fields[0];
+    if (!strcmp(cmd, "CANCEL") || !strcmp(cmd, "STOP")) {
+        if (nf != 2) return serve_bad_frame(id, cur_id);
+        int control = !strcmp(cmd, "CANCEL") ? 3 : 1;
+        if (cur_id && !strcmp(id, cur_id)) return control;
+        for (int i = 0; i < g_qn; i++) if (!strcmp(id, g_q[i].id)) {
+            if (control == 1) g_q[i].stop_requested = 1;
+            else {
+                free(g_q[i].payload);
+                memmove(g_q + i, g_q + i + 1, (size_t)(--g_qn - i) * sizeof(SReq));
+                serve_emit_terminal(id, 3, 0, 0, 0, 0, 0, 0);
+            }
+            return 0;
+        }
+        printf("ERROR %s NOT_FOUND\n", id); fflush(stdout); return 0;
+    }
+    if (strcmp(cmd, "SUBMIT") || (nf != 7 && nf != 8))
+        return serve_bad_frame(id, cur_id);
+    long long slot, plen, max_tok, alen = 0;
+    char *end;
+    if (!serve_integer(fields[2], &slot) || !serve_integer(fields[3], &plen) ||
+        !serve_integer(fields[4], &max_tok) ||
+        (nf == 8 && !serve_integer(fields[7], &alen)) ||
+        plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26))
+        return serve_bad_frame(id, cur_id);
+    float temp = strtof(fields[5], &end);
+    if (end == fields[5] || *end) return serve_bad_frame(id, cur_id);
+    float top_p = strtof(fields[6], &end);
+    if (end == fields[6] || *end) return serve_bad_frame(id, cur_id);
+    (void)slot;
+    char *pl = malloc((size_t)plen + 1);
+    if (!pl || fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) {
+        free(pl); return serve_bad_frame(id, cur_id);
+    }
+    pl[plen] = 0;
+    /* Unsupported extensions are still framed bytes, never control lines. */
+    char discard[4096];
+    for (long long left = alen; left > 0;) {
+        size_t n = left > (long long)sizeof(discard) ? sizeof(discard) : (size_t)left;
+        if (fread(discard, 1, n, stdin) != n) { free(pl); return serve_bad_frame(id, cur_id); }
+        left -= (long long)n;
+    }
+    if (fgetc(stdin) != '\n') { free(pl); return serve_bad_frame(id, cur_id); }
+    if (max_tok < 1 || max_tok > (1<<20) || alen) {
+        printf("ERROR %s bad submit header\n", id); fflush(stdout); free(pl); return 0;
+    }
+    if (g_qn < SRV_QMAX) {
+        SReq *q = &g_q[g_qn++];
+        snprintf(q->id, sizeof(q->id), "%s", id);
+        q->max_tok = (int)max_tok; q->temp = temp; q->top_p = top_p;
+        q->payload = pl; q->plen = (int)plen; q->stop_requested = 0;
+    } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
     return 0;
+}
+
+static int serve_poll_controls(const char *active_id) {
+    int control = 0;
+    if (g_input_bad) return -2;
+    while (!g_input_closed && coli_stdin_readable()) {
+        int r = serve_read_cmd(active_id);
+        if (r == -2) { g_input_bad = 1; serve_clear_queue(); return -2; }
+        if (r == 3 || (r == 1 && control != 3)) control = r;
+    }
+    return control ? control : (g_input_closed ? -1 : 0);
 }
 
 static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
     Cfg *c = &m->c;
+    int control = serve_poll_controls(q->id);
+    if (control == 3 || control == -2) {
+        serve_emit_terminal(q->id, control, 0, 0, 0, rss_gb(), 0, 0); return;
+    }
+    if (control != 1) control = q->stop_requested ? 1 : 0;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
     if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
     if (np + q->max_tok > ctx_cap) {
-        printf("ERROR %s context exceeds CTX (%d + %d > %d)\n", q->id, np, q->max_tok, ctx_cap);
+        printf("ERROR %s CONTEXT_EXCEEDED %d %d\n", q->id, np + q->max_tok, ctx_cap);
         fflush(stdout); free(ids); return;
+    }
+    printf("ACCEPT %s %d\n", q->id, np); fflush(stdout);
+    int next_control = serve_poll_controls(q->id);
+    if (next_control == -2 || next_control == 3 || next_control == 1) control = next_control;
+    if (control) {
+        serve_emit_terminal(q->id, control, 0, 0, 0, rss_gb(), np, 0); free(ids); return;
     }
     g_temp = q->temp; g_nuc = q->top_p;
     double t0 = now_s();
     uint64_t h0 = m->hits, m0 = m->miss;
     float *logit = step(m, ids, np, 0);
-    int hist_len = np, gen = 0, limited = 1, cancelled = 0;
+    int hist_len = np, gen = 0, limited = 1;
+    control = serve_poll_controls(q->id);
+    if (control == -1) control = 0;
     char buf[512];
-    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+    for (int s = 0; s < q->max_tok && !control; s++) {
         int nt = pick_tok(logit, c->vocab, -1);
         free(logit); logit = NULL;
         if (is_stop(nt)) { limited = 0; break; }
@@ -1186,22 +1283,21 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         fwrite(buf, 1, (size_t)nb, stdout);
         fputc('\n', stdout); fflush(stdout);
         gen++; hist_len++;
-        while (coli_stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
-            if (r > 0) { cancelled = 1; limited = 0; }
-        }
+        control = serve_poll_controls(q->id);
+        if (control == -1) control = 0;
         /* Unlike run_chat(), we do not step() the final token just to populate
          * its KV slot: nothing in serve mode reads past this request's own
          * reply, so a discarded logit here costs nothing. */
-        if (cancelled || s == q->max_tok - 1 || hist_len >= ctx_cap) break;
+        if (control || s == q->max_tok - 1 || hist_len >= ctx_cap) break;
         logit = step(m, &nt, 1, hist_len - 1);
+        control = serve_poll_controls(q->id);
+        if (control == -1) control = 0;
     }
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    serve_emit_terminal(q->id, control, gen, dt > 0 ? gen/dt : 0.0,
+                        tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
     /* PROF: per-turn phase timings for the dashboard. olmoe.c does not split
      * its wall time into fill/expert/shared/attn phases the way glm.c and
      * inkling.c do, so this reports total time only; a real phase breakdown
@@ -1277,11 +1373,13 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        if (serve_poll_controls(NULL) == -2) return;
+        while (!g_qn) if (serve_read_cmd(NULL) < 0) { serve_clear_queue(); return; }
         SReq q = g_q[0];
         memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
         serve_one(m, T, &q, ctx_cap);
         free(q.payload);
+        if (g_input_bad) { serve_clear_queue(); return; }
     }
 }
 

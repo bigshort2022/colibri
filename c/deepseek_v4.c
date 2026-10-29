@@ -8832,13 +8832,14 @@ typedef struct {
     int max_tokens;
     float temperature;
     float top_p;
-    int extension_bytes;
 } V4ServeRequest;
 
 typedef struct {
     ColiV4Session *session;
     const char *request_id;
-    int cancelled;
+    int control;
+    int input_closed;
+    int emitted;
 } V4ServeStream;
 
 static double v4_serve_rss_gb(void) {
@@ -8912,39 +8913,76 @@ static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
     fflush(stdout);
 }
 
+static int v4_serve_input_closed;
+
 static int v4_serve_read_request(V4ServeRequest *request,
                                  const char *active_id) {
-    char line[512], command[16], id[64];
-    if (!fgets(line, sizeof(line), stdin)) return -1;
-    if (sscanf(line, "%15s %63s", command, id) < 2) return 0;
-    if (!strcmp(command, "CANCEL") || !strcmp(command, "STOP"))
-        return active_id && !strcmp(active_id, id);
-    if (strcmp(command, "SUBMIT")) return 0;
-
-    int slot = 0, prompt_bytes = 0, max_tokens = 0, extension_bytes = 0;
-    float temperature = 0.0f, top_p = 1.0f;
-    int fields = sscanf(line, "%*s %*s %d %d %d %f %f %d",
-                        &slot, &prompt_bytes, &max_tokens,
-                        &temperature, &top_p, &extension_bytes);
-    if (fields < 5 || slot != 0 || prompt_bytes < 0 ||
-        prompt_bytes > (1 << 24) || max_tokens < 1 ||
-        extension_bytes < 0 || extension_bytes > (1 << 24)) {
-        printf("ERROR %s bad submit header\n", id);
-        fflush(stdout);
-        return 0;
-    }
-    size_t total = (size_t)prompt_bytes + (size_t)extension_bytes;
-    char *payload = malloc(total + 1);
-    if (!payload) {
-        printf("ERROR %s out of memory\n", id);
-        fflush(stdout);
-        return 0;
-    }
-    if (fread(payload, 1, total, stdin) != total) {
-        free(payload);
+    char line[512], id[64] = "?", *fields[9], *payload = NULL;
+    if (v4_serve_input_closed) return -1;
+    if (!fgets(line, sizeof(line), stdin)) {
+        v4_serve_input_closed = 1;
         return -1;
     }
-    (void)fgetc(stdin);
+    (void)sscanf(line, "%*s %63s", id);
+    if (!strchr(line, '\n')) goto bad_frame;
+    int count = 0;
+    char *p = line;
+    while (*(p += strspn(p, " \t\r\n\v\f"))) {
+        if (count == 9) goto bad_frame;
+        fields[count++] = p;
+        p += strcspn(p, " \t\r\n\v\f");
+        if (*p) *p++ = 0;
+    }
+    if (count < 2 || strlen(fields[1]) >= sizeof(request->id)) goto bad_frame;
+    snprintf(id, sizeof(id), "%s", fields[1]);
+    if (!strcmp(fields[0], "CANCEL") || !strcmp(fields[0], "STOP")) {
+        if (count != 2) goto bad_frame;
+        if (active_id && !strcmp(active_id, id))
+            return !strcmp(fields[0], "CANCEL") ? 3 : 1;
+        printf("ERROR %s NOT_FOUND\n", id);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(fields[0], "SUBMIT") || (count != 7 && count != 8)) goto bad_frame;
+    long nums[4] = {0};
+    const int positions[] = {2, 3, 4, 7};
+    for (int i = 0; i < 4; i++) {
+        if (i == 3 && count == 7) break;
+        char *end;
+        errno = 0;
+        nums[i] = strtol(fields[positions[i]], &end, 10);
+        if (errno || *end || end == fields[positions[i]] ||
+            nums[i] < -2147483647L - 1 || nums[i] > 2147483647L) goto bad_frame;
+    }
+    if (nums[1] < 0 || nums[1] > (1 << 24) ||
+        nums[3] < 0 || nums[3] > (1 << 24)) goto bad_frame;
+    char *end;
+    float temperature = strtof(fields[5], &end);
+    if (*end || end == fields[5]) goto bad_frame;
+    float top_p = strtof(fields[6], &end);
+    if (*end || end == fields[6]) goto bad_frame;
+    int prompt_bytes = (int)nums[1], max_tokens = (int)nums[2];
+    /* Semantic rejection must not reinterpret prompt/extension as controls. */
+    int admitted = nums[0] == 0 && max_tokens >= 1 && nums[3] == 0;
+    if (admitted) payload = malloc((size_t)prompt_bytes + 1);
+    size_t remaining = (size_t)prompt_bytes + (size_t)nums[3], offset = 0;
+    char discard[4096];
+    while (remaining) {
+        size_t n = remaining < sizeof(discard) ? remaining : sizeof(discard);
+        char *dst = payload ? payload + offset : discard;
+        if (fread(dst, 1, n, stdin) != n) goto bad_frame;
+        offset += n;
+        remaining -= n;
+    }
+    if (fgetc(stdin) != '\n') goto bad_frame;
+    if (!admitted || !payload) {
+        const char *reason = nums[3] ? "unsupported request extension" :
+                             !admitted ? "bad submit header" : "out of memory";
+        printf("ERROR %s %s\n", id, reason);
+        fflush(stdout);
+        free(payload);
+        return 0;
+    }
     payload[prompt_bytes] = 0;
     memset(request, 0, sizeof(*request));
     snprintf(request->id, sizeof(request->id), "%s", id);
@@ -8953,8 +8991,15 @@ static int v4_serve_read_request(V4ServeRequest *request,
     request->max_tokens = max_tokens;
     request->temperature = temperature;
     request->top_p = top_p;
-    request->extension_bytes = extension_bytes;
     return 2;
+bad_frame:
+    free(payload);
+    v4_serve_input_closed = 1;
+    if (!active_id || strcmp(active_id, id)) {
+        printf("ERROR %s BAD_FRAME\n", id);
+        fflush(stdout);
+    }
+    return -2;
 }
 
 static void v4_serve_data(const char *id, const char *data, int bytes) {
@@ -8965,33 +9010,46 @@ static void v4_serve_data(const char *id, const char *data, int bytes) {
     fflush(stdout);
 }
 
+static int v4_serve_poll_controls(V4ServeStream *stream) {
+    while (!stream->input_closed && !v4_serve_input_closed &&
+           coli_stdin_readable()) {
+        V4ServeRequest queued = {0};
+        int result = v4_serve_read_request(&queued, stream->request_id);
+        if (result == -2) {
+            stream->control = -2;
+            stream->input_closed = 1;
+            return -2;
+        }
+        if (result == -1) break;
+        if (result == 3) stream->control = 3;
+        else if (result == 1 && stream->control != 3) stream->control = 1;
+        else if (result == 2) {
+            printf("ERROR %s engine busy\n", queued.id);
+            fflush(stdout);
+            free(queued.prompt);
+        }
+    }
+    stream->input_closed = v4_serve_input_closed;
+    return stream->control ? stream->control : (stream->input_closed ? -1 : 0);
+}
+
 static int v4_serve_token(void *user_data, int token, float logit,
                           int position, int ordinal) {
     (void)logit;
     (void)position;
     (void)ordinal;
     V4ServeStream *stream = user_data;
+    int control = v4_serve_poll_controls(stream);
+    if (control == 1 || control == 3 || control == -2) return 1;
     if (token != 1) {
         char piece[1024];
         int bytes = tok_decode(&stream->session->tokenizer, &token, 1,
                                piece, (int)sizeof(piece) - 1);
         v4_serve_data(stream->request_id, piece, bytes);
+        stream->emitted++;
     }
-    while (coli_stdin_readable()) {
-        V4ServeRequest queued = {0};
-        int result = v4_serve_read_request(&queued, stream->request_id);
-        if (result < 0 || result == 1) {
-            stream->cancelled = 1;
-            free(queued.prompt);
-            return 1;
-        }
-        if (result == 2) {
-            printf("ERROR %s engine busy\n", queued.id);
-            fflush(stdout);
-            free(queued.prompt);
-        }
-    }
-    return 0;
+    control = v4_serve_poll_controls(stream);
+    return control == 1 || control == 3 || control == -2;
 }
 
 static void v4_serve_error(const char *id, const char *message) {
@@ -9003,12 +9061,20 @@ static void v4_serve_error(const char *id, const char *message) {
     fflush(stdout);
 }
 
+static void v4_serve_emit_terminal(const char *id, int control, int emitted,
+                                  double tps, double hit, double rss,
+                                  int prompt_tokens, int length_limited,
+                                  int prefix_reused) {
+    if (control == 3) printf("ERROR %s CANCELLED\n", id);
+    else if (control == -2) printf("ERROR %s BAD_FRAME\n", id);
+    else printf("DONE %s STAT %d %.3f %.1f %.2f %d %d %d\n", id, emitted,
+                tps, hit, rss, prompt_tokens,
+                control == 1 ? 0 : length_limited, prefix_reused);
+    fflush(stdout);
+}
+
 static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                          V4ServeRequest *request) {
-    if (request->extension_bytes) {
-        v4_serve_error(request->id, "unsupported request extension");
-        return;
-    }
     if (request->temperature != 0.0f)
         fprintf(stderr, "[V4] temperature %.3g ignored; target engine is greedy\n",
                 request->temperature);
@@ -9063,7 +9129,14 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     double matmul_before =
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
-    V4ServeStream stream = {session, request->id, 0};
+    V4ServeStream stream = {.session = session, .request_id = request->id,
+                           .input_closed = v4_serve_input_closed};
+    int control = v4_serve_poll_controls(&stream);
+    if (control == 1 || control == 3 || control == -2) {
+        v4_serve_emit_terminal(request->id, control, 0, 0, 0,
+                               v4_serve_rss_gb(), prompt_count, 0, 0);
+        return;
+    }
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
     double started = spec_now();
@@ -9085,21 +9158,18 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     uint64_t hits = after.hits - before.hits;
     uint64_t misses = after.misses - before.misses;
     double hit_rate = hits + misses ? 100.0 * hits / (hits + misses) : 0.0;
-    int completion = stats.generated_tokens - (stats.eos_stopped ? 1 : 0);
-    if (completion < 0) completion = 0;
-    int length_limited = !stream.cancelled && !stats.eos_stopped &&
+    int completion = stream.emitted;
+    int length_limited = !stream.control && !stats.eos_stopped &&
                          stats.generated_tokens >= request->max_tokens;
     double decode = stats.decode_sec > 0.0 ? stats.decode_sec : elapsed;
     /* Trailing field: prompt tokens served from the previous turn's attention
      * state instead of being prefilled again. Appended rather than inserted --
      * openai_server.py accepts `len(fields) >= 7`, so an older reader ignores
      * it and a newer one can report it. */
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d %d\n",
-           request->id, completion,
-           decode > 0.0 ? completion / decode : 0.0,
-           hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
-           session->prefix_reused);
-    fflush(stdout);
+    v4_serve_emit_terminal(request->id, stream.control, completion,
+                           decode > 0.0 ? completion / decode : 0.0,
+                           hit_rate, v4_serve_rss_gb(), stats.prompt_tokens,
+                           length_limited, session->prefix_reused);
     double expert_disk_s = engine->experts
         ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
         : 0.0;
@@ -9161,7 +9231,8 @@ static int v4_serve_main(void) {
     v4_hwinfo_emit();
     coli_v4_expert_store_emit_tiers(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
-    for (;;) {
+    v4_serve_input_closed = 0;
+    while (!v4_serve_input_closed) {
         V4ServeRequest request = {0};
         int result;
         do result = v4_serve_read_request(&request, NULL); while (result == 0);
