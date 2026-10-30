@@ -1,4 +1,4 @@
-/* Freeze DeepSeek V4's serving wire before adopting serve_codec.h. */
+/* DeepSeek V4 serving wire and shared codec integration. */
 #define COLI_V4_UNIT_GENERATE_STATS
 #define COLI_V4_SKIP_GENERATE_MAIN
 #include "../deepseek_v4.c"
@@ -67,6 +67,10 @@ static void test_submit_shapes_and_controls(void)
     output = tmpfile(); assert(output); binary_stream(output);
     assert(v4_serve_read_request(input, output, &request, "other") == 0);
     fclose(input); fclose(output);
+    input = bytes_input(cancel, sizeof(cancel) - 1);
+    output = tmpfile(); assert(output); binary_stream(output);
+    assert(v4_serve_read_request(input, output, &request, "live") == 3);
+    fclose(input); fclose(output);
 }
 
 static void test_errors_and_writer_bytes(void)
@@ -75,7 +79,7 @@ static void test_errors_and_writer_bytes(void)
     FILE *input = bytes_input(bad, sizeof(bad) - 1);
     FILE *output = tmpfile(); assert(output); binary_stream(output);
     V4ServeRequest request = {0};
-    assert(v4_serve_read_request(input, output, &request, NULL) == -2);
+    assert(v4_serve_read_request(input, output, &request, NULL) == 0);
     unsigned char actual[512];
     size_t count = read_output(output, actual, sizeof(actual));
     static const char bad_want[] = "ERROR bad bad submit header\n";
@@ -128,6 +132,6 @@ int main(void)
     test_submit_shapes_and_controls();
     test_errors_and_writer_bytes();
     test_extension_rejection_precedes_accept();
-    puts("v4 serve framing baseline: ok");
+    puts("v4 serve framing: ok");
     return 0;
 }

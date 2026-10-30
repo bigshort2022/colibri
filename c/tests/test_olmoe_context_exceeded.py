@@ -69,10 +69,7 @@ class OlmoeContextExceededTest(unittest.TestCase):
     def test_an_over_long_prompt_is_refused_with_the_context_frame(self):
         fields = serve_turn(self.OVER_LONG).split()
         self.assertEqual(fields[:3], ["ERROR", "7", "CONTEXT_EXCEEDED"], fields)
-        numbers = dict(field.split("=", 1) for field in fields[3:])
-        self.assertEqual(numbers, {"prompt_tokens": "30",
-                                   "requested": str(MAX_TOKENS),
-                                   "capacity": str(CTX)})
+        self.assertEqual(fields[3:], [str(30 + MAX_TOKENS), str(CTX)])
 
     def test_the_gateway_answers_it_with_a_400(self):
         fields = serve_turn(self.OVER_LONG).split()
@@ -81,7 +78,7 @@ class OlmoeContextExceededTest(unittest.TestCase):
                               "the gateway reads this frame as an engine fault (HTTP 500)")
         self.assertEqual((error.status, error.code), (400, "context_length_exceeded"))
         self.assertIn(f"maximum context length is {CTX} tokens", error.message)
-        self.assertIn("at least 30 tokens", error.message)
+        self.assertIn(f"at least {30 + MAX_TOKENS} tokens", error.message)
 
     def test_a_prompt_that_fits_is_still_served(self):
         self.assertTrue(serve_turn(b"abc").startswith("DONE 7 "))

@@ -3,6 +3,32 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- OLMoE, Inkling, Kimi and DeepSeek V4 distinguish STOP, CANCEL, graceful input
+  EOF and fatal frames. Safe-boundary polling prevents output after controls;
+  queued STOP/CANCEL preserves OLMoE/Inkling FIFO ownership. ACCEPT precedes
+  prefill and context errors use the gateway's positional format.
+- The V4 CPU control fixture builds isolated unit objects, so GPU-built engine
+  objects cannot be reused or overwritten by a differently configured test.
+- Streaming transactions now cancel and drain after consumer callback failures,
+  including native TOOL/ECHO channels, without releasing scheduler ownership
+  early or delivering bytes after STOP/CANCEL.
+- Both HTTP streaming protocols report committed failures in-band and stop their
+  keepalive pumps on every exit. Anthropic waits for native acceptance, reports
+  authoritative input usage, and gives reopened thinking fresh block indices.
+- The shared serve codec consumes fully framed rejected payloads before
+  returning an admission error, so embedded control text cannot affect another
+  request. Untrustworthy framing remains fatal; IMAGE, prefix hints and
+  logprobs/pin extensions retain their wire contracts.
+- Browser and attached terminal chat assemble complete SSE events, stop at DONE
+  without waiting for EOF, and report server errors, malformed events and
+  interrupted streams. Stop/error preserves partial answers; empty completion
+  removes empty assistants and reports no answer content instead of lingering
+  typing. Combined reasoning/content deltas no longer lose the answer.
+
 ## [1.12.0] — 2026-09-20
 
 81 pull requests since v1.11.0. A new way to ask a model a closed question,

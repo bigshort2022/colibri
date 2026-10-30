@@ -102,21 +102,6 @@ static void test_submit_and_controls(void)
 
 static void test_invalid_headers_and_bodies(void)
 {
-    static const char *invalid[] = {
-        "SUBMIT req 0 6 4 0.7 0.95\n",
-        "SUBMIT req 0 5 0 0.7 0.95\n",
-        "SUBMIT req 0 5 5 0.7 0.95\n",
-        "SUBMIT req 0 5 4 nan 0.95\n",
-        "SUBMIT req 0 5 4 0.7 inf\n",
-        "SUBMIT req 0 5 4 0.7 0.95 extra\n",
-    };
-    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
-        FILE *input = bytes_input(invalid[i], strlen(invalid[i]));
-        ColiServeCommand command;
-        assert(coli_serve_read_command(input, &profile, &command) ==
-               COLI_SERVE_READ_BAD_REQUEST);
-        fclose(input);
-    }
 
     static const char short_body[] = "SUBMIT req 0 5 4 0.7 0.95\nabc";
     FILE *input = bytes_input(short_body, sizeof(short_body) - 1);
@@ -140,7 +125,7 @@ static void test_invalid_headers_and_bodies(void)
     assert(length > 0 && (size_t)length < sizeof(long_header));
     input = bytes_input(long_header, (size_t)length);
     assert(coli_serve_read_command(input, &profile, &command) ==
-           COLI_SERVE_READ_BAD_REQUEST);
+           COLI_SERVE_READ_BAD_FRAME);
     fclose(input);
 
     static const char unknown[] = "PING req\n";
@@ -155,8 +140,7 @@ static void test_invalid_headers_and_bodies(void)
     long_line[sizeof(long_line) - 1] = 0;
     input = bytes_input(long_line, sizeof(long_line) - 1);
     assert(coli_serve_read_command(input, &profile, &command) ==
-           COLI_SERVE_READ_BAD_REQUEST);
-    assert(fgetc(input) == EOF);
+           COLI_SERVE_READ_BAD_FRAME);
     fclose(input);
 }
 
@@ -214,12 +198,121 @@ static void test_allocation_failures_are_fatal_to_the_caller(void)
     }
 }
 
+static void test_rejected_frames_cannot_execute_payload_controls(void)
+{
+    ColiServeWireProfile bounded = profile;
+    bounded.max_payload_bytes = 256;
+    bounded.max_extension_bytes = 32;
+    static const char *headers[] = {
+        "SUBMIT bad 0 12 0 0.7 0.95",
+        "SUBMIT bad 0 12 5 0.7 0.95",
+        "SUBMIT bad nope 12 4 0.7 0.95",
+        "SUBMIT bad 0 12 4 nope 0.95",
+        "SUBMIT bad 0 12 4 0.7 inf",
+        "SUBMIT bad 0 12 4 0.7 0.95 logprobs=1 logprobs=2",
+        "SUBMIT bad 0 12 4 0.7 0.95 unknown=1",
+    };
+    for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
+        char frame[512];
+        int length = snprintf(frame, sizeof(frame),
+                              "%s\nCANCEL live\n\nSTOP next\n", headers[i]);
+        assert(length > 0 && (size_t)length < sizeof(frame));
+        FILE *input = bytes_input(frame, (size_t)length);
+        ColiServeCommand command;
+        assert(coli_serve_read_command(input, &bounded, &command) ==
+               COLI_SERVE_READ_BAD_REQUEST);
+        assert(command.payload == NULL);
+        assert(strcmp(command.id, "bad") == 0);
+        assert(coli_serve_read_command(input, &bounded, &command) ==
+               COLI_SERVE_READ_OK);
+        assert(command.kind == COLI_SERVE_COMMAND_STOP);
+        assert(strcmp(command.id, "next") == 0);
+        coli_serve_command_dispose(&command);
+        fclose(input);
+    }
+
+    static const char extension[] =
+        "SUBMIT bad 0 1 4 0.7 0.95 12\nxCANCEL live\n\n"
+        "SUBMIT next 0 2 4 0.7 0.95\nok\n";
+    FILE *input = bytes_input(extension, sizeof(extension) - 1);
+    ColiServeCommand command;
+    assert(coli_serve_read_command(input, &bounded, &command) ==
+           COLI_SERVE_READ_BAD_REQUEST);
+    assert(command.payload == NULL);
+    assert(coli_serve_read_command(input, &bounded, &command) ==
+           COLI_SERVE_READ_OK);
+    assert(strcmp(command.id, "next") == 0);
+    assert(memcmp(command.payload, "ok", 2) == 0);
+    coli_serve_command_dispose(&command);
+    fclose(input);
+}
+
+static void test_untrustworthy_frames_are_fatal(void)
+{
+    static const char *frames[] = {
+        "SUBMIT bad 0 -1 4 0.7 0.95\nCANCEL live\n",
+        "SUBMIT bad 0 18446744073709551616 4 0.7 0.95\n",
+        "SUBMIT bad 0 6 4 0.7 0.95\nabcdef\n",
+        "SUBMIT bad 0 1 4 0.7 0.95 999\nx\n",
+        "SUBMIT bad 0 1 4 0.7 0.95",
+        "SUBMIT bad 0 1 4 0.7 0.95 garbage\nx\n",
+    };
+    for (size_t i = 0; i < sizeof(frames) / sizeof(frames[0]); i++) {
+        FILE *input = bytes_input(frames[i], strlen(frames[i]));
+        ColiServeCommand command;
+        assert(coli_serve_read_command(input, &profile, &command) ==
+               COLI_SERVE_READ_BAD_FRAME);
+        assert(command.payload == NULL);
+        fclose(input);
+    }
+}
+
+static void test_read_only_prefix_and_named_extensions(void)
+{
+    ColiServeWireProfile extended = profile;
+    extended.allow_extension_bytes = 1;
+    extended.allow_prefix_hint = 1;
+    extended.max_extension_bytes = 4;
+    static const char frame[] =
+        "SUBMIT score 0 3 0 0 1 4 2 logprobs=2 pin=1\nabcWXYZ\n";
+    FILE *input = bytes_input(frame, sizeof(frame) - 1);
+    ColiServeCommand command;
+    assert(coli_serve_read_command(input, &extended, &command) == COLI_SERVE_READ_OK);
+    assert(command.max_tokens == 0 && command.logprobs == 2 && command.pin == 1);
+    assert(command.prefix_bytes == 2);
+    assert(memcmp(command.payload, "abc", 3) == 0);
+    assert(memcmp(coli_serve_command_extension(&command), "WXYZ", 4) == 0);
+    coli_serve_command_dispose(&command);
+    fclose(input);
+}
+
+static void test_rejected_image_consumes_its_payload(void)
+{
+    ColiServeWireProfile bounded = profile;
+    bounded.max_payload_bytes = 256;
+    static const char frame[] =
+        "IMAGE picture 12 0 1\nCANCEL live\n\nSTOP next\n";
+    FILE *input = bytes_input(frame, sizeof(frame) - 1);
+    ColiServeCommand command;
+    assert(coli_serve_read_command(input, &bounded, &command) ==
+           COLI_SERVE_READ_BAD_REQUEST);
+    assert(command.payload == NULL && strcmp(command.id, "picture") == 0);
+    assert(coli_serve_read_command(input, &bounded, &command) == COLI_SERVE_READ_OK);
+    assert(command.kind == COLI_SERVE_COMMAND_STOP && strcmp(command.id, "next") == 0);
+    coli_serve_command_dispose(&command);
+    fclose(input);
+}
+
 int main(void)
 {
     test_submit_and_controls();
     test_invalid_headers_and_bodies();
     test_writer_golden_bytes();
     test_allocation_failures_are_fatal_to_the_caller();
+    test_rejected_frames_cannot_execute_payload_controls();
+    test_untrustworthy_frames_are_fatal();
+    test_read_only_prefix_and_named_extensions();
+    test_rejected_image_consumes_its_payload();
     puts("serve codec tests: ok");
     return 0;
 }

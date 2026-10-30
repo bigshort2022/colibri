@@ -1,4 +1,4 @@
-/* Freeze Kimi K3's existing request framing before adopting serve_codec.h. */
+/* Kimi K3 framing and byte-preserving codec integration. */
 #define main kimi_k3_main_unused
 #include "../kimi_k3.c"
 #undef main
@@ -61,7 +61,7 @@ static void test_controls_match_only_active_request(void)
     for(size_t i=0;i<2;i++){
         ServeReq request={0};
         FILE *match=bytes_input(commands[i],strlen(commands[i]));
-        assert(serve_read_req(match,out,&request,"req-7")==1); fclose(match);
+        assert(serve_read_req(match,out,&request,"req-7")==(i==0?1:3)); fclose(match);
         FILE *other=bytes_input(commands[i],strlen(commands[i]));
         assert(serve_read_req(other,out,&request,"req-8")==0); fclose(other);
     }
@@ -76,7 +76,7 @@ static void test_errors_and_busy_payload_are_byte_exact(void)
     ServeReq request={0};
     assert(serve_read_req(in,out,&request,NULL)==-2);
     char output[128]; size_t count=read_output(out,output,sizeof(output));
-    static const char want[]="ERROR bad bad submit header\n";
+    static const char want[]="ERROR bad BAD_FRAME\n";
     assert(count==sizeof(want)-1&&memcmp(output,want,count)==0);
     fclose(in); fclose(out);
 
@@ -104,9 +104,8 @@ static void test_malformed_submit_cannot_become_a_control(void)
         FILE *out=tmpfile(); assert(out); binary_stream(out);
         ServeReq request={0};
         assert(serve_read_req(in,out,&request,"live")==-2);
-        assert(fgetc(in)=='C');
         char output[64]; size_t count=read_output(out,output,sizeof(output));
-        static const char want[]="ERROR bad bad submit header\n";
+        static const char want[]="ERROR bad BAD_FRAME\n";
         assert(count==sizeof(want)-1&&memcmp(output,want,count)==0);
         fclose(in); fclose(out);
     }
@@ -117,7 +116,6 @@ static void test_malformed_submit_cannot_become_a_control(void)
     FILE *out=tmpfile(); assert(out); binary_stream(out);
     ServeReq request={0};
     assert(serve_read_req(in,out,&request,"live")==-2);
-    assert(fgetc(in)=='S');
     fclose(in); fclose(out);
 }
 
@@ -127,6 +125,6 @@ int main(void)
     test_controls_match_only_active_request();
     test_errors_and_busy_payload_are_byte_exact();
     test_malformed_submit_cannot_become_a_control();
-    puts("kimi serve framing baseline: ok");
+    puts("kimi serve framing: ok");
     return 0;
 }

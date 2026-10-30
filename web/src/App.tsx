@@ -94,6 +94,7 @@ export default function App() {
   const [error, setError] = useState("")
   const autoConnected = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
+  const activeAssistantRef = useRef<string | null>(null)
   const probeRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const messages = conversations[cacheSlot] || []
@@ -211,13 +212,17 @@ export default function App() {
 
   const send = async (text = draft, previous = messages, pictures = pending) => {
     const content = text.trim()
-    if ((!content && !pictures.length) || loading) return
+    if ((!content && !pictures.length) || loading || abortRef.current) return
     const user = message("user", content, pictures)
     const assistant = message("assistant", "")
     const history = [...previous, user]
+    const controller = new AbortController()
+    abortRef.current = controller
+    activeAssistantRef.current = assistant.id
     setDraft("")
     setPending([])
     setError("")
+    setLastRun(null)
     updateMessages([...history, assistant])
     setLoading(true)
     setStreamStart(null)
@@ -228,8 +233,7 @@ export default function App() {
     const t0 = performance.now()
     let firstToken = true
     let count = 0
-    const controller = new AbortController()
-    abortRef.current = controller
+    let receivedContent = false
     try {
       const result = await streamChat({
         baseUrl,
@@ -242,6 +246,8 @@ export default function App() {
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
         signal: controller.signal,
         onDelta: (delta) => {
+          if (abortRef.current !== controller || controller.signal.aborted) return
+          if (delta) receivedContent = true
           if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
           count++
           setTokenCount(count)
@@ -256,6 +262,7 @@ export default function App() {
           ))
         },
       })
+      if (abortRef.current !== controller || controller.signal.aborted) return
       /* The turn's own figure keeps the same meaning as the live one, so the
          badge does not jump to a different number the moment it stops moving. */
       const decodeElapsed = (performance.now() - (decodeStart || t0)) / 1000
@@ -266,7 +273,12 @@ export default function App() {
       }))
       setLastRun(result)
       setConnected(true)
+      if (!receivedContent) {
+        updateMessages((current) => current.filter((item) => item.id !== assistant.id))
+        setError("The server returned no answer content.")
+      }
     } catch (cause) {
+      if (abortRef.current !== controller) return
       if (controller.signal.aborted) {
         updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
       } else {
@@ -274,8 +286,11 @@ export default function App() {
         updateMessages((current) => current.filter((item) => item.id !== assistant.id || item.content))
       }
     } finally {
-      abortRef.current = null
-      setLoading(false)
+      if (abortRef.current === controller) {
+        abortRef.current = null
+        activeAssistantRef.current = null
+        setLoading(false)
+      }
     }
   }
 
@@ -408,7 +423,7 @@ export default function App() {
             {item.role !== "user" && <div className="assistant-brand"><Brand /><span>colibrì</span></div>}
             {item.images?.length ? <div className="message-images">{item.images.map((url, at) =>
               <img key={at} src={url} alt={t("ui.attachedImage", { n: at + 1 })} />)}</div> : null}
-            <div className="message-body">{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span>}</div>
+            <div className="message-body">{item.content ? (item.role === "assistant" ? <Markdown text={item.content} /> : item.content) : loading && item.id === activeAssistantRef.current ? <span className="typing" aria-label={t("ui.generating")}><i /><i /><i /></span> : null}</div>
             {item.role === "assistant" && item.content && <div className="message-actions"><button className="icon-action" aria-label={t("ui.copy")} title={t("ui.copy")} onClick={() => void copyMessage(item)}><Copy /></button>{copied === item.id && <span role="status">{t("ui.copied")}</span>}{index === messages.length - 1 && !loading && <button className="icon-action" aria-label={t("ui.regenerate")} title={t("ui.regenerate")} onClick={() => { const userIndex = messages.map((m, i) => m.role === "user" && i < index ? i : -1).reduce((a, b) => Math.max(a, b), -1); if (userIndex >= 0) void send(messages[userIndex].content, messages.slice(0, userIndex)) }}><RefreshCw /></button>}</div>}
           </article>)}<div ref={bottomRef} /></div>
         </div>}

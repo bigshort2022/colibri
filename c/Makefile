@@ -494,7 +494,7 @@ TEST_RULES  := $(shell sed -n 's|^tests/\(test_[a-z0-9_]*\)\$$(EXE):.*|\1|p' $(f
 # unconditional rules and therefore remain portable gates.
 # test_qwen38_tier_engine drives qwen38.c over the generated FP8 fixture
 # (qwen38_tiny_fp8, gitignored); it runs from qwen38-tier-engine-check.
-TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing \
+TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_framing test_v4_serve_control \
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_qwen38_tier_engine
@@ -505,7 +505,7 @@ endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
-	tests/test_v4_serve_framing$(EXE) \
+	tests/test_v4_serve_framing$(EXE) tests/test_v4_serve_control$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
 	tests/test_edge_adapters_registration$(EXE)
 endif
@@ -1194,6 +1194,10 @@ NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
+# Production-source control fixtures must stay CPU-only even in a GPU build.
+SERVE_CONTROL_CFLAGS = $(filter-out -DCOLI_METAL -DCOLI_VULKAN -DCOLI_V4_GPU_TIER,$(NOCUDA_CFLAGS))
+SERVE_CONTROL_LDFLAGS = $(filter-out -framework Metal Foundation -lc++ -lvulkan,$(NOCUDA_LDFLAGS))
+
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
 # METAL=1 accelerates resident matrices and routed MoE; CPU remains fallback.
 glm53$(EXE): glm53.c decode_batch.h pin_pool.h cli_args.h st.h json.h stop_ids.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h serve_poll.h route_trace.h quant.h hyper_connections.h delta_attention.h sparse_index.h vision_tower.h backend_metal.h backend_vulkan.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
@@ -1370,6 +1374,9 @@ tests/test_segment_conformance$(EXE): tests/test_segment_conformance.c tests/seg
 tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_inkling_serve_control$(EXE): tests/test_inkling_serve_control.c inkling.c cli_args.h pin_pool.h decode_batch.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h
+	$(CC) $(SERVE_CONTROL_CFLAGS) $< -o $@ $(SERVE_CONTROL_LDFLAGS)
+
 tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
@@ -1383,6 +1390,9 @@ tests/test_inkling_cache_index$(EXE): tests/test_inkling_cache_index.c inkling.c
 
 tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_kimi_serve_control$(EXE): tests/test_kimi_serve_control.c kimi_k3.c cli_args.h pin_pool.h hybrid_split.h decode_batch.h kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(SERVE_CONTROL_CFLAGS) $< -o $@ $(SERVE_CONTROL_LDFLAGS)
 
 tests/test_kimi_cache_index$(EXE): tests/test_kimi_cache_index.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
@@ -1398,6 +1408,9 @@ tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c st.h json.h
 
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_olmoe_serve_control$(EXE): tests/test_olmoe_serve_control.c olmoe.c cli_args.h pin_pool.h decode_batch.h fused_simd.h st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h
+	$(CC) $(SERVE_CONTROL_CFLAGS) $< -o $@ $(SERVE_CONTROL_LDFLAGS)
 
 tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
@@ -1763,6 +1776,21 @@ tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c deepseek_v4.c \
 		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
+
+V4_SERVE_CONTROL_DIR = build/serve-control
+V4_SERVE_CONTROL_OBJS = $(addprefix $(V4_SERVE_CONTROL_DIR)/,$(addsuffix .o,$(filter-out COLI_V4_UNIT_GENERATE_STATS,$(V4_TARGET_UNITS))))
+V4_SERVE_CONTROL_REGISTRY = $(V4_SERVE_CONTROL_DIR)/expert_store_registry.o
+tests/test_v4_serve_control$(EXE): tests/test_v4_serve_control.c deepseek_v4.c \
+		deepseek_v4.h deepseek_v4_internal.h deepseek_v4_dspark.inc serve_codec.h \
+		decode_batch.h kv_prefix.h tok.h st.h native_quant.h native_quant_batch.h \
+		native_quant_dual.h native_quant_fp4_rows16.h expert_store_registry.c expert_store_registry.h \
+		Makefile.deepseek-v4 Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) CUDA=0 \
+		V4_UNIT_OBJECT_DIR=$(V4_SERVE_CONTROL_DIR) \
+		CFLAGS='$(SERVE_CONTROL_CFLAGS) -pthread -include pthread.h' \
+		$(V4_SERVE_CONTROL_OBJS) $(V4_SERVE_CONTROL_REGISTRY)
+	$(CC) $(SERVE_CONTROL_CFLAGS) -pthread -include pthread.h $< \
+		$(V4_SERVE_CONTROL_OBJS) $(V4_SERVE_CONTROL_REGISTRY) -o $@ -pthread $(SERVE_CONTROL_LDFLAGS)
 
 endif
 

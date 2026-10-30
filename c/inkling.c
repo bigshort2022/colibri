@@ -2208,16 +2208,16 @@ static const char *prompt_reject(int np, int want) {
     int ctx_max = cm ? atoi(cm) : 8192;
     if (np + want <= ctx_max) return NULL;
     snprintf(message, sizeof(message),
-             "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
-             np, want, ctx_max);
+             "CONTEXT_EXCEEDED %d %d", np + want, ctx_max);
     return message;
 }
 
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
                  uint8_t *audio; int alen;
-                 int logprobs, pin; } SReq;   /* raw DMel bytes after the payload; SUBMIT logprobs=k / pin=1 */
+                 int logprobs, pin, stop_requested; } SReq;   /* audio aliases the payload allocation */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static int g_input_closed = 0;
 static const ColiServeWireProfile inkling_wire = {
     .max_header_bytes = 511,
     .max_payload_bytes = 1u << 22,
@@ -2235,52 +2235,50 @@ static void serve_request_dispose(SReq *request) {
     memset(request, 0, sizeof(*request));
 }
 
-static int stdin_readable(void) {
-    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
-     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
-    return coli_stdin_readable();
-}
-
-/* read one control line (+ payload for SUBMIT). cur_id: request in flight;
- * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
+/* -2=fatal frame, -1=EOF, 0=continue, 1=STOP, 3=CANCEL. SUBMITs join the FIFO. */
 static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
     ColiServeCommand command;
     ColiServeReadResult result=coli_serve_read_command(input,&inkling_wire,&command);
-    if(result==COLI_SERVE_READ_EOF) return -1;
-    if(result==COLI_SERVE_READ_BAD_FRAME) return -2;
-    if(result==COLI_SERVE_READ_NOMEM){
-        coli_serve_write_error(output,command.id,"out of memory"); return -2;
+    if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME ||
+        result == COLI_SERVE_READ_NOMEM ||
+        (result == COLI_SERVE_READ_BAD_REQUEST &&
+         (command.kind == COLI_SERVE_COMMAND_STOP || command.kind == COLI_SERVE_COMMAND_CANCEL))) {
+        g_input_closed = 1;
+        if (result != COLI_SERVE_READ_EOF && command.id[0] &&
+            (!cur_id || strcmp(command.id, cur_id)))
+            coli_serve_write_error(output, command.id, "BAD_FRAME");
+        coli_serve_command_dispose(&command);
+        return result == COLI_SERVE_READ_EOF ? -1 : -2;
     }
-    if(result==COLI_SERVE_READ_BAD_REQUEST&&
-       command.kind==COLI_SERVE_COMMAND_SUBMIT){
-        /* 6th field (optional, backward compatible): DMel byte count appended
-         * verbatim after the text payload — frames x mel_bins u8 levels */
-        /* SEC: max_tok was the one field nobody validated, and it is the one
-         * the context check is built on. prompt_reject() asks
-         * `np + want > ctx_max`; a negative `want` makes that sum smaller than
-         * np, so the check passes for any prompt length. kv_alloc() is then
-         * sized on the same np + max_tok + 8 and comes out shorter than the
-         * prompt, and prefill writes past the end of the K/V cache -- a heap
-         * overflow whose length and contents both follow from the request.
-         *
-         * The official gateway forces a positive integer, so this is not
-         * reachable through openai_server.py. The SERVE protocol is public and
-         * anything bridging it (socat, a custom gateway, a sidecar) exposes it
-         * directly, so the check belongs here, next to the one plen already
-         * has, rather than in one of its callers. */
-        coli_serve_write_error(output,command.id,"bad submit header"); return -2;
+    if (result != COLI_SERVE_READ_OK) {
+        if (result == COLI_SERVE_READ_BAD_REQUEST)
+            coli_serve_write_error(output, command.id, "bad submit header");
+        coli_serve_command_dispose(&command);
+        return 0;
     }
-    if(result!=COLI_SERVE_READ_OK) return 0;
-    if(command.kind==COLI_SERVE_COMMAND_CANCEL){
-        int matched=cur_id&&!strcmp(command.id,cur_id);
-        coli_serve_command_dispose(&command); return matched;
-    }
-    if(command.kind==COLI_SERVE_COMMAND_STOP){
-        coli_serve_command_dispose(&command); return 0;
-    }
-    if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
+    if (command.kind == COLI_SERVE_COMMAND_CANCEL ||
+        command.kind == COLI_SERVE_COMMAND_STOP) {
+        int control = command.kind == COLI_SERVE_COMMAND_CANCEL ? 3 : 1;
+        if (cur_id && !strcmp(command.id, cur_id)) {
+            coli_serve_command_dispose(&command);
+            return control;
+        }
+        int i;
+        for (i = 0; i < g_qn; i++) if (!strcmp(g_q[i].id, command.id)) break;
+        if (i == g_qn) {
+            coli_serve_write_error(output, command.id, "NOT_FOUND");
+        } else if (control == 1) {
+            g_q[i].stop_requested = 1;
+        } else {
+            serve_request_dispose(&g_q[i]);
+            memmove(g_q + i, g_q + i + 1, (size_t)(--g_qn - i) * sizeof(SReq));
+            memset(&g_q[g_qn], 0, sizeof(SReq));
+            coli_serve_write_error(output, command.id, "CANCELLED");
+        }
+    } else if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
+            memset(q, 0, sizeof(*q));
             snprintf(q->id, sizeof(q->id), "%s", command.id);
             q->max_tok=command.max_tokens; q->temp=command.temperature;
             q->logprobs=command.logprobs; q->pin=command.pin;
@@ -2292,6 +2290,31 @@ static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
     }
     coli_serve_command_dispose(&command);
     return 0;
+}
+
+static int serve_merge_control(int current, int next) {
+    if (current == -2 || next == -2) return -2;
+    if (current == 3 || next == 3) return 3;
+    if (current == 1 || next == 1) return 1;
+    return next == -1 || current == -1 ? -1 : 0;
+}
+
+static int serve_poll_controls(const char *active_id) {
+    int control = 0;
+    while (!g_input_closed && coli_stdin_readable()) {
+        control = serve_merge_control(control, serve_read_cmd(stdin, stdout, active_id));
+        if (control == -2) break;
+    }
+    return control;
+}
+
+static void serve_emit_terminal(FILE *out, const char *id, int control, ColiServeDone *done) {
+    if (control == 3) coli_serve_write_error(out, id, "CANCELLED");
+    else if (control == -2) coli_serve_write_error(out, id, "BAD_FRAME");
+    else {
+        if (control == 1) done->length_limited = 0;
+        coli_serve_write_done(out, id, done);
+    }
 }
 
 /* HITS rows cols hex: which experts this turn routed, one bit each over the
@@ -2319,6 +2342,12 @@ static void serve_hits(Model *m) {
 
 static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
+    int control = serve_merge_control(q->stop_requested ? 1 : 0, serve_poll_controls(q->id));
+    if (control == 3 || control == -2) {
+        ColiServeDone done = {0};
+        serve_emit_terminal(stdout, q->id, control, &done);
+        return control == -2 ? -2 : 0;
+    }
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
@@ -2334,6 +2363,14 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
                  naud,audio_tok_count(m,ids,np),
                  m->audio_norm?"":" — snapshot has no audio tensors");
         coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
+    }
+    coli_serve_write_accept(stdout, q->id, np);
+    control = serve_merge_control(control, serve_poll_controls(q->id));
+    if (control == 1 || control == 3 || control == -2) {
+        ColiServeDone done = {.prompt_tokens = np};
+        serve_emit_terminal(stdout, q->id, control, &done);
+        free(ids);
+        return control == -2 ? -2 : 0;
     }
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
@@ -2416,13 +2453,15 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     }
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     int forwards = 1;                      /* il prefill e' il primo forward */
-    int len = np, gen = 0, limited = 1, cancelled = 0;
+    int len = np, gen = 0, limited = 1;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
     float rep = getenv("REP_PEN") ? atof(getenv("REP_PEN")) : 1.1f;
     int hist[128], nhist = 0;
     for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
-    for (int s = 0; s < q->max_tok && !cancelled; s++) {
+    for (int s = 0; s < q->max_tok; s++) {
+        control = serve_merge_control(control, serve_poll_controls(q->id));
+        if (control == 1 || control == 3 || control == -2) break;
         apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
         char lptail[1024]; lptail[0] = 0;
@@ -2435,12 +2474,8 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
         if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
         else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
-        while (stdin_readable()) {
-            int r = serve_read_cmd(stdin, stdout, q->id);
-            if (r < 0) { free(ids); return -1; }
-            if (r > 0) { cancelled = 1; limited = 0; }
-        }
-        if (cancelled || s == q->max_tok - 1) break;
+        control = serve_merge_control(control, serve_poll_controls(q->id));
+        if (control == 1 || control == 3 || control == -2 || s == q->max_tok - 1) break;
         logit = step(m, &tk, 1, len - 1, NULL); forwards++;
     }
     free(logit);
@@ -2448,9 +2483,8 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     double tot = (double)(m->hits - h0 + m->miss - m0);
     ColiServeDone done={gen,dt>0?gen/dt:0.0,
                         tot?100.0*(m->hits-h0)/tot:0.0,rss_gb(),np,limited};
-    char done_line[256];
-    int done_bytes=coli_serve_format_done(done_line,sizeof(done_line),q->id,&done);
-    if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
+    control = serve_merge_control(control, serve_poll_controls(q->id));
+    serve_emit_terminal(stdout, q->id, control, &done);
     /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
      * expert_wait -> shared-expert compute, lm_head folded into 0). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
@@ -2458,7 +2492,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     fflush(stdout);
     serve_hits(m);
     free(ids);
-    return 0;
+    return control == -2 ? -2 : 0;
 }
 
 /* ---------- dashboard protocol (HWINFO / TIERS / EMAP) ----------
@@ -2534,13 +2568,18 @@ static void serve_loop(Model *m, Tok *T) {
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
+        while (!g_qn && !g_input_closed)
+            if (serve_read_cmd(stdin, stdout, NULL) == -2) {
+                while (g_qn) serve_request_dispose(&g_q[--g_qn]);
+                return;
+            }
+        if (!g_qn) return;
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
         int fatal=serve_one(m,T,&q);
         serve_tiers_emap(m);
         serve_request_dispose(&q);
-        if(fatal<0){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); return; }
+        if(fatal == -2){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); return; }
     }
 }
 
