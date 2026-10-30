@@ -1,4 +1,4 @@
-/* Freeze Inkling's text + binary DMel framing before adopting serve_codec.h. */
+/* Inkling production text and binary DMel framing, without model weights. */
 #define main inkling_main_unused
 #include "../inkling.c"
 #undef main
@@ -65,10 +65,10 @@ static void test_controls_and_queue_full_preserve_behavior(void)
     FILE *output=tmpfile(); assert(output); binary_stream(output);
     static const char cancel[]="CANCEL live\n";
     FILE *input=bytes_input(cancel,sizeof(cancel)-1);
-    assert(serve_read_cmd(input,output,"live")==1); fclose(input);
+    assert(serve_read_cmd(input,output,"live")==3); fclose(input);
     static const char stop[]="STOP live\n";
     input=bytes_input(stop,sizeof(stop)-1);
-    assert(serve_read_cmd(input,output,"live")==0); fclose(input);
+    assert(serve_read_cmd(input,output,"live")==1); fclose(input);
 
     g_qn=SRV_QMAX;
     static const char full[]="SUBMIT full 0 1 1 0 1 4\nxWXYZ\n";
@@ -84,11 +84,12 @@ static void test_controls_and_queue_full_preserve_behavior(void)
 static void test_malformed_submit_cannot_become_control(void)
 {
     static const char frame[]=
-        "SUBMIT bad 0 12 0 0.7 0.95 4\nCANCEL liveWXYZ\n";
+        "SUBMIT bad 0 12 0 0.7 0.95 4\nCANCEL live\nWXYZ\nSTOP live\n";
     FILE *input=bytes_input(frame,sizeof(frame)-1);
     FILE *output=tmpfile(); assert(output); binary_stream(output);
-    assert(serve_read_cmd(input,output,"live")==-2);
-    assert(fgetc(input)=='C');
+    assert(serve_read_cmd(input,output,"live")==0);
+    assert(serve_read_cmd(input,output,"live")==1);
+    assert(fgetc(input)==EOF);
     fclose(input); fclose(output);
 
     static const char bad_term[]=
@@ -108,7 +109,7 @@ static void test_over_long_prompt_is_refused_with_the_context_frame(void)
     assert(prompt_reject(12,4)==NULL);
     const char *refusal=prompt_reject(30,4);
     assert(refusal);
-    assert(strcmp(refusal,"CONTEXT_EXCEEDED prompt_tokens=30 requested=4 capacity=16")==0);
+    assert(strcmp(refusal,"CONTEXT_EXCEEDED 34 16")==0);
 }
 
 int main(void)
@@ -117,6 +118,6 @@ int main(void)
     test_controls_and_queue_full_preserve_behavior();
     test_malformed_submit_cannot_become_control();
     test_over_long_prompt_is_refused_with_the_context_frame();
-    puts("inkling serve framing baseline: ok");
+    puts("inkling serve framing: ok");
     return 0;
 }

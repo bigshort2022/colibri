@@ -1,3 +1,4 @@
+import queue
 import http.client
 import io
 import json
@@ -1161,6 +1162,156 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
 
 
+    def test_callback_failure_drains_before_releasing_request(self):
+        for callback in ("accept", "text", "tool", "echo"):
+            with self.subTest(callback=callback):
+                cancel = threading.Event()
+                original = ValueError("consumer failed")
+
+                def respond(process, frame):
+                    command, rid = frame.split()[:2]
+                    if command == b"SUBMIT":
+                        if rid == b"1":
+                            channel = {"accept": b"DATA 1 1\nx\n", "text": b"DATA 1 1\nx\n",
+                                       "tool": b"TOOL 1 1\nx\n",
+                                       "echo": b"ECHO 1 1 0 -1 0\nx\n"}[callback]
+                            process.stdout.feed(b"ACCEPT 1 7\n" + channel)
+                        else:
+                            process.stdout.feed(b"DATA " + rid + b" 1\nx\n"
+                                                b"DONE " + rid + b" STAT 1 1 0 1 7 0\n")
+                    elif command == b"CANCEL":
+                        cancel.set()
+
+                process = FakeProcess(respond)
+                with patch("openai_server.subprocess.Popen", return_value=process):
+                    engine = Engine("glm", "model")
+                self.addCleanup(engine.close)
+                errors, output = [], []
+
+                def fail(_):
+                    raise original
+
+                def generate():
+                    try:
+                        engine.generate("hi", 8, 0.7, 0.9,
+                                        fail if callback == "text" else output.append,
+                                        on_accept=fail if callback == "accept" else None,
+                                        on_tool=fail if callback == "tool" else output.append,
+                                        on_echo=fail if callback == "echo" else output.append)
+                    except Exception as error:
+                        errors.append(error)
+
+                worker = threading.Thread(target=generate)
+                worker.start()
+                observed = cancel.wait(1)
+                owned = "1" in engine.pending and worker.is_alive()
+                process.stdout.feed(b"DATA 1 4\nlate\nTOOL 1 4\nlate\n"
+                                    b"ECHO 1 4 0 -1 0\nlate\nERROR 1 CANCELLED\n")
+                worker.join(2)
+                self.assertTrue(observed, "consumer failure did not cancel native work")
+                self.assertTrue(owned, "native ownership released before acknowledgement")
+                self.assertEqual(errors, [original])
+                self.assertEqual(output, [])
+                self.assertFalse(engine.pending)
+                following = []
+                engine.generate("again", 8, 0.7, 0.9, following.append)
+                self.assertEqual(following, ["x"])
+                self.assertEqual(sum(frame.startswith(b"CANCEL") for frame in process.writes), 1)
+
+    def test_cancel_with_legacy_done_never_commits_or_flushes(self):
+        def respond(process, frame):
+            command, rid = frame.split()[:2]
+            if command == b"CANCEL":
+                process.stdout.feed(b"ACCEPT " + rid + b" 7\nDATA " + rid + b" 1\nx\n"
+                                    b"TOOL " + rid + b" 1\nx\n"
+                                    b"ECHO " + rid + b" 1 0 -1 0\nx\n"
+                                    b"DONE " + rid + b" STAT 1 1 0 1 7 0\n")
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        output, accepts = [], []
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hi", 8, 0.7, 0.9, output.append,
+                            cancelled=lambda: True, on_accept=accepts.append,
+                            on_tool=output.append, on_echo=output.append)
+        self.assertEqual(output, [])
+        self.assertEqual(accepts, [])
+        self.assertFalse(engine.pending)
+
+    def test_stop_does_not_flush_incomplete_utf8_or_later_data(self):
+        def respond(process, frame):
+            command, rid = frame.split()[:2]
+            if command == b"SUBMIT":
+                process.stdout.feed(b"DATA " + rid + b" 2\nx\xc3\n")
+            elif command == b"STOP":
+                process.stdout.feed(b"DATA " + rid + b" 4\nlate\n"
+                                    b"TOOL " + rid + b" 1\nx\n"
+                                    b"ECHO " + rid + b" 1 0 -1 0\nx\n"
+                                    b"DONE " + rid + b" STAT 1 1 0 1 7 0\n")
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        output = []
+        engine.generate("hi", 8, 0.7, 0.9, output.append, stopped=lambda: bool(output),
+                        on_tool=output.append, on_echo=output.append)
+        self.assertEqual(output, ["x"])
+
+    def test_callback_error_survives_dispatcher_failure_during_drain(self):
+        original = ValueError("consumer failed")
+
+        def respond(process, frame):
+            if frame.startswith(b"SUBMIT"):
+                process.stdout.feed(b"ACCEPT 1 7\nDATA 1 1\nx\n")
+            elif frame.startswith(b"CANCEL"):
+                process.stdout.close()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+
+        def fail(_):
+            raise original
+
+        with self.assertRaises(ValueError) as caught:
+            engine.generate("hi", 8, 0.7, 0.9, fail)
+        self.assertIs(caught.exception, original)
+        self.assertFalse(engine.pending)
+        self.assertIsNotNone(engine.dispatcher_error)
+        self.assertEqual(sum(frame.startswith(b"CANCEL") for frame in process.writes), 1)
+
+    def test_echo_logprobs_pin_and_image_keep_their_wire_and_callbacks(self):
+        def respond(process, frame):
+            if frame.startswith(b"SUBMIT"):
+                process.stdout.feed(
+                    b"ACCEPT 1 7\nECHO 1 2 0 nan 0\nhi\n"
+                    b"ECHO 1 1 1 -0.25 1 42 -0.25\nx\n"
+                    b"TOOL 1 0\n\nDATA 1 2 -0.5 1 42 -0.5\nok\n"
+                    b"DONE 1 STAT 1 1 0 1 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "glm53"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm53", "model")
+        self.addCleanup(engine.close)
+        accepted, echoes, tools, text = [], [], [], []
+        stats = engine.generate("hi", 8, 0.7, 0.9, text.append,
+                                on_accept=accepted.append, on_echo=echoes.append,
+                                on_tool=tools.append, image=(b"\x00\x01\x02\x03", 1, 1),
+                                logprobs=1, pin=True)
+        self.assertEqual(process.writes, [
+            b"IMAGE 1 4 1 1\n\x00\x01\x02\x03\n",
+            b"SUBMIT 1 0 2 8 0.7 0.9 logprobs=1 pin=1\nhi\n"])
+        self.assertEqual(accepted, [{"prompt_tokens": 7}])
+        self.assertEqual(echoes, [{"pos": 0, "logprob": None, "text": "hi"},
+                                 {"pos": 1, "logprob": -0.25, "text": "x"}])
+        self.assertEqual(tools, [""])
+        self.assertEqual(text, ["ok"])
+        self.assertEqual(stats["prompt_tokens"], 7)
+
+
 class CapSentinelShimTest(unittest.TestCase):
     # #379 cap-sentinel shim, arch-keyed (#386 r2, F3): an absent cap is
     # "platform-auto" only for the glm engine (colibri.c coli_resolve_cap);
@@ -2321,6 +2472,25 @@ class GlmReasoningStreamTest(unittest.TestCase):
         self.assertEqual(message["content"], "final answer")
 
 
+    def test_streamed_tool_only_and_prefixed_tool_finish(self):
+        tool = "<tool_call>f<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>"
+        for prefix in ("", "Let me check. "):
+            with self.subTest(prefix=prefix):
+                base = self._server(tuple(prefix + tool))
+                raw = self._post(base, {"model": "test-model", "stream": True,
+                                       "messages": [{"role": "user", "content": "x"}],
+                                       "tools": [{"type": "function", "function": {
+                                           "name": "f", "parameters": {"type": "object",
+                                           "properties": {"x": {"type": "string"}}}}}]})
+                _, content, calls = self._deltas(raw)
+                self.assertEqual(content, prefix)
+                self.assertEqual(len(calls), 1)
+                frames = [json.loads(line[6:]) for line in raw.splitlines()
+                          if line.startswith("data: ") and line != "data: [DONE]"]
+                self.assertEqual(frames[-1]["choices"][0]["finish_reason"], "tool_calls")
+                self.assertEqual(raw.count("data: [DONE]"), 1)
+
+
 class AcceptFrameTest(unittest.TestCase):
     """#597 item 6: the engine's ACCEPT frame gates the HTTP commit, and its invariants."""
 
@@ -2373,6 +2543,9 @@ class AcceptFrameTest(unittest.TestCase):
 
     def test_duplicate_accept_is_a_protocol_error(self):
         def respond(process, frame):
+            if frame.startswith(b"CANCEL"):
+                process.stdout.feed(b"ERROR " + frame.split()[1] + b" CANCELLED\n")
+                return
             rid = frame.split()[1]
             process.stdout.feed(b"ACCEPT " + rid + b" 10\n")
             process.stdout.feed(b"ACCEPT " + rid + b" 10\n")
@@ -2388,6 +2561,116 @@ class _ContextExceededEngine(FakeEngine):
                  cancelled=None, grammar=None, stopped=None, on_accept=None):
         raise APIError(400, "This model's maximum context length is 4094 tokens.",
                        "messages", "context_length_exceeded")
+
+
+class StreamingLifecycleTest(unittest.TestCase):
+    """Real dispatcher + HTTP coverage, including an observed idle cancellation poll."""
+
+    def _fixture(self):
+        submitted = threading.Event()
+        cancelled = threading.Event()
+        idle_polled = threading.Event()
+        real_queue = queue.Queue
+
+        class ObservedQueue(real_queue):
+            idle = False
+
+            def get(self, *args, **kwargs):
+                if self.idle:
+                    idle_polled.set()
+                try:
+                    return super().get(*args, **kwargs)
+                except queue.Empty:
+                    self.idle = True
+                    raise
+
+        def respond(process, frame):
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                submitted.set()
+            elif fields[0] == b"CANCEL":
+                cancelled.set()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        server = APIServer(("127.0.0.1", 0), engine, "test-model")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        return process, engine, server, submitted, cancelled, idle_polled, ObservedQueue
+
+    def test_live_prefill_delayed_or_missing_accept(self):
+        for path in ("/v1/chat/completions", "/v1/completions"):
+            for accept in (True, False):
+                with self.subTest(path=path, accept=accept):
+                    process, engine, server, submitted, cancelled, polled, queues = self._fixture()
+                    body = {"model": "test-model", "stream": True,
+                            "stream_options": {"include_usage": True}, "thinking": False}
+                    body.update({"messages": [{"role": "user", "content": "Paris?"}]}
+                                if "chat" in path else {"prompt": "Paris?"})
+                    result = []
+
+                    def request():
+                        req = Request(f"http://127.0.0.1:{server.server_port}" + path,
+                                      data=json.dumps(body).encode(),
+                                      headers={"Content-Type": "application/json"})
+                        with urlopen(req, timeout=3) as response:
+                            result.append(response.read().decode())
+
+                    with patch("openai_server.queue.Queue", queues):
+                        worker = threading.Thread(target=request)
+                        worker.start()
+                        self.assertTrue(submitted.wait(2))
+                        self.assertTrue(polled.wait(2), "idle queue poll did not run")
+                        was_cancelled = cancelled.is_set()
+                        if accept:
+                            process.stdout.feed(b"ACCEPT 1 7\n")
+                        process.stdout.feed(b"DATA 1 5\nParis\nDONE 1 STAT 1 1 0 1 7 0\n")
+                        worker.join(3)
+                    self.assertFalse(worker.is_alive())
+                    self.assertFalse(was_cancelled, process.writes)
+                    self.assertEqual(result[0].count("data: [DONE]"), 1)
+                    events = [json.loads(line[6:]) for line in result[0].splitlines()
+                              if line.startswith("data: ") and line != "data: [DONE]"]
+                    text = "".join(choice.get("delta", {}).get("content", "")
+                                   if "chat" in path else choice.get("text", "")
+                                   for event in events for choice in event["choices"])
+                    self.assertEqual(text, "Paris")
+                    self.assertEqual(events[-1]["usage"]["prompt_tokens"], 7)
+
+    def test_closed_peer_keeps_slot_until_cancel_acknowledgement(self):
+        for during_decode in (False, True):
+            with self.subTest(during_decode=during_decode):
+                process, engine, server, submitted, cancelled, _, _ = self._fixture()
+                sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
+                body = json.dumps({"model": "test-model", "stream": True,
+                                   "messages": [{"role": "user", "content": "hello"}]})
+                sock.sendall((f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                              f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+                              + body).encode())
+                self.assertTrue(submitted.wait(2))
+                if during_decode:
+                    process.stdout.feed(b"ACCEPT 1 7\nDATA 1 5\nParis\n")
+                    received = b""
+                    while b"Paris" not in received:
+                        chunk = sock.recv(4096)
+                        self.assertTrue(chunk)
+                        received += chunk
+                sock.close()
+                self.assertTrue(cancelled.wait(2))
+                self.assertEqual(server.scheduler.active, 1)
+                self.assertIn("1", engine.pending)
+                process.stdout.feed(b"DATA 1 4\nlate\nERROR 1 CANCELLED\n")
+                with server.scheduler.condition:
+                    self.assertTrue(server.scheduler.condition.wait_for(
+                        lambda: server.scheduler.active == 0, timeout=2))
+                self.assertFalse(engine.pending)
+                self.assertEqual(sum(frame.startswith(b"CANCEL") for frame in process.writes), 1)
 
 
 class StreamingContextRejectTest(unittest.TestCase):
@@ -2596,6 +2879,141 @@ class KeepAliveFramingTest(unittest.TestCase):
         self.assertEqual(self._post(conn)[0], 200)
         self.assertEqual(self._post(conn)[0], 200)
         self.assertIsNotNone(conn.sock, "the JSON path should keep the connection open")
+
+
+    def test_stream_errors_are_in_band_and_keepalive_is_joined(self):
+        real_thread = threading.Thread
+        pumps = []
+
+        def make_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            if getattr(kwargs.get("target"), "__name__", "") in ("_keepalive", "keepalive"):
+                pumps.append(thread)
+            return thread
+
+        for path in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
+            with self.subTest(path=path):
+                server = self._server(_ExplodingEngine())
+                body = dict(self.CHAT, stream=True, max_tokens=16)
+                if path == "/v1/completions":
+                    body = {"model": "test-model", "stream": True, "prompt": "hello"}
+                request = self._request_bytes(body).replace(
+                    b"/v1/chat/completions", path.encode(), 1)
+                with patch("openai_server.threading.Thread", side_effect=make_thread):
+                    raw = self._raw(server, request)
+                self.assertEqual(raw.count("HTTP/1."), 1)
+                payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                            if line.startswith("data: ")]
+                errors = [payload for payload in payloads if "error" in payload]
+                self.assertEqual(len(errors), 1)
+                self.assertIn("failed to process", errors[0]["error"]["message"])
+                self.assertNotIn("engine died", raw)
+                self.assertNotIn("[DONE]", raw)
+                self.assertNotIn("event: message_stop", raw)
+                self.assertTrue(pumps)
+                self.assertTrue(all(not pump.is_alive() for pump in pumps))
+
+    def test_controlled_idle_keepalive_and_pump_lifetime(self):
+        real_event, real_thread = threading.Event, threading.Thread
+        for path in ("/v1/chat/completions", "/v1/completions", "/v1/messages"):
+            for outcome in ("success", "error", "cancel"):
+                with self.subTest(path=path, outcome=outcome):
+                    release, waiting, wake = real_event(), real_event(), real_event()
+                    clock, pumps, stops = [time.time()], [], []
+
+                    class ControlledStop:
+                        def __init__(self):
+                            self.stopped = real_event()
+
+                        def wait(self, timeout=None):
+                            waiting.set()
+                            if not wake.wait(3):
+                                raise AssertionError("keepalive wake was not supplied")
+                            wake.clear()
+                            return self.stopped.is_set()
+
+                        def set(self):
+                            self.stopped.set()
+                            wake.set()
+
+                        def is_set(self):
+                            return self.stopped.is_set()
+
+                    def event_factory():
+                        if sys._getframe(1).f_code.co_name in ("generation", "anthropic_generation"):
+                            stop = ControlledStop()
+                            stops.append(stop)
+                            return stop
+                        return real_event()
+
+                    def thread_factory(*args, **kwargs):
+                        thread = real_thread(*args, **kwargs)
+                        if getattr(kwargs.get("target"), "__name__", "") in ("_keepalive", "keepalive"):
+                            pumps.append(thread)
+                        return thread
+
+                    def generate(*args, on_accept=None, **kwargs):
+                        on_accept({"prompt_tokens": 7})
+                        if not release.wait(3):
+                            raise AssertionError("generation release was not supplied")
+                        if outcome == "error":
+                            raise APIError(500, "controlled failure", None, "engine_error", "server_error")
+                        if outcome == "cancel":
+                            raise ClientCancelled()
+                        args[4]("Paris")
+                        return {"prompt_tokens": 7, "completion_tokens": 1, "length_limited": False}
+
+                    engine = FakeEngine()
+                    engine.generate = generate
+                    server = self._server(engine)
+                    body = dict(self.CHAT, stream=True, max_tokens=16)
+                    if path == "/v1/completions":
+                        body = {"model": "test-model", "stream": True, "prompt": "hello"}
+                    req = Request(f"http://127.0.0.1:{server.server_port}" + path,
+                                  data=json.dumps(body).encode(),
+                                  headers={"Content-Type": "application/json"})
+                    with patch("openai_server.threading.Event", new=event_factory), \
+                         patch("openai_server.threading.Thread", side_effect=thread_factory), \
+                         patch("openai_server.time.time", side_effect=lambda: clock[0]):
+                        try:
+                            with urlopen(req, timeout=3) as response:
+                                self.assertTrue(waiting.wait(2))
+                                clock[0] += 20
+                                wake.set()
+                                prefix = []
+                                while True:
+                                    line = response.readline().decode()
+                                    self.assertTrue(line, "stream ended before idle keepalive")
+                                    prefix.append(line)
+                                    if not line.startswith("data: "):
+                                        continue
+                                    payload = json.loads(line[6:])
+                                    if path == "/v1/messages":
+                                        if payload["type"] == "ping":
+                                            break
+                                    else:
+                                        choice = payload["choices"][0]
+                                        if path == "/v1/completions":
+                                            self.assertEqual(choice["text"], "")
+                                            self.assertNotIn("delta", choice)
+                                            break
+                                        if "reasoning_content" in choice["delta"]:
+                                            self.assertEqual(choice["delta"]["reasoning_content"], "")
+                                            break
+                                release.set()
+                                raw = "".join(prefix) + response.read().decode()
+                        finally:
+                            release.set()
+                    self.assertTrue(all(stop.is_set() for stop in stops))
+                    self.assertTrue(pumps)
+                    self.assertTrue(all(not pump.is_alive() for pump in pumps))
+                    terminator = "event: message_stop" if path == "/v1/messages" else "data: [DONE]"
+                    self.assertEqual(raw.count(terminator), int(outcome == "success"))
+                    self.assertEqual(raw.count('"message":"controlled failure"'), int(outcome == "error"))
+                    terminal_position = raw.find(terminator)
+                    if terminal_position >= 0:
+                        self.assertNotIn("ping", raw[terminal_position:])
+                        self.assertNotIn("reasoning_content", raw[terminal_position:])
 
 
 class ConversationCacheSlotTest(unittest.TestCase):

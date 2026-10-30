@@ -1,5 +1,4 @@
-/* Freeze OLMoE's existing request framing before moving it behind a shared
- * codec. This includes the production parser and queue, but no model weights. */
+/* OLMoE production framing and queue ownership, without model weights. */
 #define OLMOE_TESTING 1
 #define main coli_olmoe_main_unused
 #include "../olmoe.c"
@@ -73,7 +72,7 @@ static void test_cancel_only_matches_active_request(void)
     binary_stream(out);
 
     FILE *match = bytes_input(cancel, sizeof(cancel) - 1);
-    assert(serve_read_cmd(match, out, "req-7") == 1);
+    assert(serve_read_cmd(match, out, "req-7") == 3);
     fclose(match);
 
     FILE *other = bytes_input(cancel, sizeof(cancel) - 1);
@@ -89,10 +88,10 @@ static void test_errors_are_byte_exact_and_frames_are_consumed(void)
     FILE *bad_out = tmpfile();
     assert(bad_out);
     binary_stream(bad_out);
-    assert(serve_read_cmd(bad_in, bad_out, NULL) == -1);
+    assert(serve_read_cmd(bad_in, bad_out, NULL) == -2);
     char output[128];
     size_t count = read_output(bad_out, output, sizeof(output));
-    static const char bad_want[] = "ERROR bad bad submit header\n";
+    static const char bad_want[] = "ERROR bad BAD_FRAME\n";
     assert(count == sizeof(bad_want) - 1);
     assert(memcmp(output, bad_want, count) == 0);
     fclose(bad_in);
@@ -118,8 +117,8 @@ static void test_errors_are_byte_exact_and_frames_are_consumed(void)
 static void test_invalid_submit_does_not_parse_its_payload_as_control(void)
 {
     static const char *frames[] = {
-        "SUBMIT bad 0 13 0 0.7 0.95\nCANCEL live\n\n",
-        "SUBMIT bad 0 13 4 0.7 0.95 extra extra\nCANCEL live\n\n",
+        "SUBMIT bad 0 12 0 0.7 0.95\nCANCEL live\n\nSTOP live\n",
+        "SUBMIT bad 0 12 4 0.7 0.95 1\nCANCEL live\nx\nSTOP live\n",
     };
     for (size_t i = 0; i < sizeof(frames) / sizeof(frames[0]); i++) {
         FILE *input = bytes_input(frames[i], strlen(frames[i]));
@@ -127,8 +126,9 @@ static void test_invalid_submit_does_not_parse_its_payload_as_control(void)
         assert(output);
         binary_stream(output);
 
-        assert(serve_read_cmd(input, output, "live") == -1);
-        assert(fgetc(input) == 'C');
+        assert(serve_read_cmd(input, output, "live") == 0);
+        assert(serve_read_cmd(input, output, "live") == 1);
+        assert(fgetc(input) == EOF);
         char bytes[64];
         size_t count = read_output(output, bytes, sizeof(bytes));
         static const char want[] = "ERROR bad bad submit header\n";
@@ -150,8 +150,7 @@ static void test_invalid_submit_does_not_parse_its_payload_as_control(void)
     FILE *output = tmpfile();
     assert(output);
     binary_stream(output);
-    assert(serve_read_cmd(input, output, "live") == -1);
-    assert(fgetc(input) == 'C');
+    assert(serve_read_cmd(input, output, "live") == -2);
     fclose(input);
     fclose(output);
 }
@@ -166,11 +165,13 @@ static void test_bad_frame_stops_before_the_next_command(void)
     assert(output);
     binary_stream(output);
 
-    assert(serve_read_cmd(input, output, NULL) == -1);
+    assert(serve_read_cmd(input, output, NULL) == -2);
     assert(g_qn == 0);
     assert(fgetc(input) == 'S');
-    char bytes[16];
-    assert(read_output(output, bytes, sizeof(bytes)) == 0);
+    char bytes[64];
+    static const char want[] = "ERROR broken BAD_FRAME\n";
+    size_t n = read_output(output, bytes, sizeof(bytes));
+    assert(n == sizeof(want)-1 && memcmp(bytes, want, n) == 0);
     fclose(input);
     fclose(output);
 }
@@ -182,6 +183,6 @@ int main(void)
     test_errors_are_byte_exact_and_frames_are_consumed();
     test_invalid_submit_does_not_parse_its_payload_as_control();
     test_bad_frame_stops_before_the_next_command();
-    puts("olmoe serve framing baseline: ok");
+    puts("olmoe serve framing: ok");
     return 0;
 }

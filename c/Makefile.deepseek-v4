@@ -220,12 +220,23 @@ V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
 V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
 V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
 REGISTRY_OBJ = expert_store_registry.o
+# Isolated consumers can reuse these unit recipes without sharing the engine's
+# flag-dependent root objects. The production object layout stays unchanged.
+V4_ISOLATED_OBJS = $(if $(strip $(V4_UNIT_OBJECT_DIR)),$(addprefix $(V4_UNIT_OBJECT_DIR)/,$(TARGET_OBJS) $(TEST_UNIT_OBJS)))
+V4_ISOLATED_REGISTRY = $(if $(strip $(V4_UNIT_OBJECT_DIR)),$(V4_UNIT_OBJECT_DIR)/$(REGISTRY_OBJ))
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
 	deepseek-v4-test-registry print-v4-objs
 deepseek-v4: $(V4_BINARY)
+
+ifneq ($(strip $(V4_UNIT_OBJECT_DIR)),)
+$(V4_UNIT_OBJECT_DIR):
+	mkdir -p "$@"
+
+$(V4_ISOLATED_OBJS) $(V4_ISOLATED_REGISTRY): | $(V4_UNIT_OBJECT_DIR)
+endif
 
 # Build just the amalgamation unit + registry objects (no link). External
 # trees (e.g. a downstream integration) reuse these .o's to link an
@@ -242,15 +253,15 @@ $(V4_BINARY): $(V4_OBJS)
 
 # Pluggable expert-store backend registry (standalone; not a deepseek_v4.c unit).
 # Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
-$(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h
+$(REGISTRY_OBJ) $(V4_ISOLATED_REGISTRY): expert_store_registry.c expert_store_registry.h expert_store.h
 	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
 
-$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
+$(TARGET_OBJS) $(TEST_UNIT_OBJS) $(V4_ISOLATED_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
 	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h expert_store_registry.h
-	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+	$(CC) $(CFLAGS) -D$(notdir $*) -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
 		st.h json.h compat.h tensor.h quant.h route_trace.h \

@@ -13815,8 +13815,9 @@ typedef struct {
 typedef struct {
     ColiV4Session *session;
     const char *request_id;
-    int cancelled;
-    int fatal;
+    int control;
+    int input_closed;
+    int emitted;
 } V4ServeStream;
 
 static const ColiServeWireProfile v4_wire = {
@@ -14005,28 +14006,41 @@ static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
     fflush(stdout);
 }
 
+static int v4_serve_input_closed;
+
 static int v4_serve_read_request(FILE *input, FILE *output,
                                  V4ServeRequest *request,
                                  const char *active_id) {
     ColiServeCommand command;
     ColiServeReadResult result = coli_serve_read_command(input, &v4_wire, &command);
-    if (result == COLI_SERVE_READ_EOF) return -1;
-    if (result == COLI_SERVE_READ_BAD_FRAME) return -2;
-    if (result == COLI_SERVE_READ_NOMEM) {
-        coli_serve_write_error(output, command.id, "out of memory");
+    if (result == COLI_SERVE_READ_EOF) {
+        v4_serve_input_closed = 1;
+        return -1;
+    }
+    if (result == COLI_SERVE_READ_BAD_FRAME || result == COLI_SERVE_READ_NOMEM ||
+        (result == COLI_SERVE_READ_BAD_REQUEST &&
+         (command.kind == COLI_SERVE_COMMAND_STOP ||
+          command.kind == COLI_SERVE_COMMAND_CANCEL))) {
+        v4_serve_input_closed = 1;
+        if (command.id[0] && (!active_id || strcmp(active_id, command.id)))
+            coli_serve_write_error(output, command.id, "BAD_FRAME");
+        coli_serve_command_dispose(&command);
         return -2;
     }
     if (result == COLI_SERVE_READ_BAD_REQUEST &&
         command.kind == COLI_SERVE_COMMAND_SUBMIT) {
         coli_serve_write_error(output, command.id, "bad submit header");
-        return -2;
+        coli_serve_command_dispose(&command);
+        return 0;
     }
     if (result != COLI_SERVE_READ_OK) return 0;
     if (command.kind == COLI_SERVE_COMMAND_STOP ||
         command.kind == COLI_SERVE_COMMAND_CANCEL) {
         int matched = active_id && !strcmp(active_id, command.id);
+        int control = command.kind == COLI_SERVE_COMMAND_CANCEL ? 3 : 1;
+        if (!matched) coli_serve_write_error(output, command.id, "NOT_FOUND");
         coli_serve_command_dispose(&command);
-        return matched;
+        return matched ? control : 0;
     }
     if (command.kind != COLI_SERVE_COMMAND_SUBMIT) {
         coli_serve_command_dispose(&command);
@@ -14035,7 +14049,7 @@ static int v4_serve_read_request(FILE *input, FILE *output,
     if (command.slot != 0) {
         coli_serve_write_error(output, command.id, "bad submit header");
         coli_serve_command_dispose(&command);
-        return -2;
+        return 0;
     }
     int prefix_bytes = command.prefix_bytes;
     if (prefix_bytes < 0 || (uint64_t)prefix_bytes > command.payload_bytes)
@@ -14059,27 +14073,24 @@ static void v4_serve_data(FILE *output, const char *id,
     coli_serve_write_data(output, id, data, (size_t)bytes);
 }
 
-/* Drain gateway commands queued behind an active request: CANCEL/STOP for the
- * active id (or stdin EOF) reports "stop generating"; a SUBMIT that arrives
- * while the engine is busy is answered with an engine-busy ERROR so its
- * gateway thread fails fast instead of waiting on a pipe nobody is reading. */
-static int v4_serve_drain_commands(V4ServeStream *stream) {
-    while (coli_stdin_readable()) {
+/* Drain readable commands; EOF ends admission but does not cancel accepted work.
+ * Keep the strongest outcome until its one terminal response is committed. */
+static int v4_serve_poll_controls(V4ServeStream *stream) {
+    if (v4_serve_input_closed) stream->input_closed = 1;
+    while (!stream->input_closed && coli_stdin_readable()) {
         V4ServeRequest queued = {0};
         int result = v4_serve_read_request(stdin, stdout, &queued,
-                                           stream->request_id);
-        if (result < 0) {
-            if (result == -2) stream->fatal = 1;
-            free(queued.prompt);
-            return 1;
-        }
-        if (result == 1) { free(queued.prompt); return 1; }
-        if (result == 2) {
+                                          stream->request_id);
+        if (result == -2) { stream->control = -2; break; }
+        if (result == -1) { stream->input_closed = 1; break; }
+        if (result == 3) stream->control = 3;
+        else if (result == 1 && !stream->control) stream->control = 1;
+        else if (result == 2) {
             coli_serve_write_error(stdout, queued.id, "engine busy");
             free(queued.prompt);
         }
     }
-    return 0;
+    return stream->control ? stream->control : stream->input_closed ? -1 : 0;
 }
 
 static int v4_serve_token(void *user_data, int token, float logit,
@@ -14088,17 +14099,17 @@ static int v4_serve_token(void *user_data, int token, float logit,
     (void)position;
     (void)ordinal;
     V4ServeStream *stream = user_data;
+    v4_serve_poll_controls(stream);
+    if (stream->control) return 1;
     if (token != 1) {
         char piece[1024];
         int bytes = tok_decode(&stream->session->tokenizer, &token, 1,
                                piece, (int)sizeof(piece) - 1);
         v4_serve_data(stdout, stream->request_id, piece, bytes);
+        stream->emitted++;
     }
-    if (v4_serve_drain_commands(stream)) {
-        stream->cancelled = 1;
-        return 1;
-    }
-    return 0;
+    v4_serve_poll_controls(stream);
+    return stream->control != 0;
 }
 
 /* Prefill-phase abort poll (ColiV4SessionAbortFn). The token callback above
@@ -14107,12 +14118,8 @@ static int v4_serve_token(void *user_data, int token, float logit,
  * later SUBMIT queued behind a request nobody wants anymore. */
 static int v4_serve_abort(void *user_data) {
     V4ServeStream *stream = user_data;
-    if (stream->cancelled) return 1;
-    if (v4_serve_drain_commands(stream)) {
-        stream->cancelled = 1;
-        return 1;
-    }
-    return 0;
+    v4_serve_poll_controls(stream);
+    return stream->control != 0;
 }
 
 static void v4_serve_error(FILE *output, const char *id, const char *message) {
@@ -14127,6 +14134,18 @@ static void v4_serve_done(FILE *output, const char *id, int completion,
     ColiServeDone done = {completion, tokens_per_second, hit_rate, rss,
                           prompt_tokens, length_limited};
     coli_serve_write_done_i32_suffix(output, id, &done, &prefix_reused, 1);
+}
+
+static void v4_serve_emit_terminal(const char *id, int control, int emitted,
+                                   double tps, double hit, double rss,
+                                   int prompt_tokens, int length_limited,
+                                   int prefix_reused) {
+    if (control == -2 || control == 3) {
+        v4_serve_error(stdout, id, control == 3 ? "CANCELLED" : "BAD_FRAME");
+        return;
+    }
+    v4_serve_done(stdout, id, emitted, tps, hit, rss, prompt_tokens,
+                  control == 1 ? 0 : length_limited, prefix_reused);
 }
 
 static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
@@ -14180,6 +14199,13 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         request->max_tokens = context - prompt_count;
     }
     coli_serve_write_accept(stdout, request->id, prompt_count);
+    V4ServeStream stream = {.session = session, .request_id = request->id};
+    v4_serve_poll_controls(&stream);
+    if (stream.control) {
+        v4_serve_emit_terminal(request->id, stream.control, 0, 0, 0,
+                               v4_serve_rss_gb(), prompt_count, 0, 0);
+        return stream.control == -2 ? -1 : 0;
+    }
 
     ColiExpertStoreStats before = {0}, after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
@@ -14190,7 +14216,6 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
     double block_before = g_v4_prof_block_s, head_before = g_v4_prof_head_s;
     long long forwards_before = g_v4_prof_forwards;
-    V4ServeStream stream = {session, request->id, 0, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
     double started = spec_now();
@@ -14206,8 +14231,8 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;
-    if (stream.fatal) return -1;
-    if (result) {
+    v4_serve_poll_controls(&stream);
+    if (result && !stream.control) {
         v4_serve_error(stdout, request->id, error);
         return 0;
     }
@@ -14216,19 +14241,18 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     uint64_t hits = after.hits - before.hits;
     uint64_t misses = after.misses - before.misses;
     double hit_rate = hits + misses ? 100.0 * hits / (hits + misses) : 0.0;
-    int completion = stats.generated_tokens - (stats.eos_stopped ? 1 : 0);
-    if (completion < 0) completion = 0;
-    int length_limited = !stream.cancelled && !stats.eos_stopped &&
+    int completion = stream.emitted;
+    int length_limited = !stream.control && !stats.eos_stopped &&
                          stats.generated_tokens >= request->max_tokens;
     double decode = stats.decode_sec > 0.0 ? stats.decode_sec : elapsed;
     /* Trailing field: prompt tokens served from the previous turn's attention
      * state instead of being prefilled again. Appended rather than inserted --
      * openai_server.py accepts `len(fields) >= 7`, so an older reader ignores
      * it and a newer one can report it. */
-    v4_serve_done(stdout, request->id, completion,
-                  decode > 0.0 ? completion / decode : 0.0,
-                  hit_rate, v4_serve_rss_gb(), stats.prompt_tokens,
-                  length_limited, session->prefix_reused);
+    v4_serve_emit_terminal(request->id, stream.control, completion,
+                           decode > 0.0 ? completion / decode : 0.0,
+                           hit_rate, v4_serve_rss_gb(), prompt_count,
+                           length_limited, session->prefix_reused);
     double expert_disk_s = engine->experts
         ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
         : 0.0;
@@ -14273,7 +14297,7 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                                &g_v4_mir_nread[r], __ATOMIC_RELAXED));
         fprintf(stderr, "%s\n", line);
     }
-    return 0;
+    return stream.control == -2 ? -1 : 0;
 }
 
 static int v4_serve_main(void) {
@@ -14335,7 +14359,7 @@ static int v4_serve_main(void) {
     v4_hwinfo_emit();
     coli_v4_expert_store_emit_tiers(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
-    for (;;) {
+    while (!v4_serve_input_closed) {
         V4ServeRequest request = {0};
         int result;
         do result = v4_serve_read_request(stdin, stdout, &request, NULL);

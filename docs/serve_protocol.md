@@ -60,6 +60,24 @@ CANCEL <id>\n
 - `CANCEL` aborts a request after its client disconnects and returns `CANCELLED`.
 - EOF on stdin = graceful shutdown: in-flight requests finish first.
 
+Serial OLMoE, Inkling, Kimi and DeepSeek V4 emit ACCEPT with the prompt count
+after validation and before prefill. Context errors use
+`CONTEXT_EXCEEDED <used> <limit>`. Controls are drained at the engines' existing
+forward/callback boundaries before more output, with CANCEL taking precedence
+over STOP. STOP produces normal DONE with `length_limited=0`; cancellation
+produces CANCELLED without DONE. OLMoE/Inkling queued STOP preserves FIFO and
+becomes an accepted zero-output completion; queued CANCEL removes only its entry.
+Input EOF closes admission but finishes accepted active and queued work.
+
+The shared `serve_codec.h` separates framing from admission. A rejected SUBMIT
+with trustworthy, bounded lengths still consumes all declared text/extension
+bytes and its delimiter before returning BAD_REQUEST. IMAGE payloads follow the
+same ownership rule. Embedded `CANCEL` text is never a subsequent command.
+Incomplete/overlong headers, untrustworthy lengths, truncated payloads and bad
+delimiters are fatal BAD_FRAME: the caller must close input rather than guess a
+resynchronization point. Family payload/audio ceilings remain in their existing
+wire profiles; named `logprobs`/`pin` fields and V4 prefix hints keep their meaning.
+
 Prefill is serial; decode is continuously batched — every active slot contributes
 one row per forward.
 
@@ -118,6 +136,47 @@ All telemetry is advisory: servers render what they know and skip the rest.
   gpus, entropy, repin}`.
 - `GET /*` — static hosting of `web/dist` (SPA fallback, path-traversal-safe), plus
   `experts.json` if published there (the measured expert atlas, #175/#218).
+
+### SSE lifetime and built-in clients
+
+OpenAI chat/completions and Anthropic messages commit SSE success headers only
+after native acceptance (or an older engine's first DATA/DONE). A live prefill
+does not imply cancellation. Disconnects and consumer callback failures request
+CANCEL and retain transaction ownership until terminal acknowledgement. Once
+STOP/CANCEL is sent, DATA, TOOL, ECHO and decoder tails cannot reach consumers.
+
+Before acceptance, errors remain HTTP JSON errors. After acceptance, OpenAI
+emits a data event containing an `error` envelope; Anthropic emits a named `error`
+event. Error paths never emit a success terminator or another HTTP status line.
+Keepalive pumps stop and join on success, failure and disconnect. Anthropic opens
+only blocks with actual content and allocates increasing indices when reasoning
+reopens; input usage comes from ACCEPT or authoritative terminal statistics.
+
+Browser and attached terminal chat assemble all data fields in a complete SSE
+event, supporting multiline/no-space fields, comments, LF/CRLF/CR and incremental
+UTF-8. They require `[DONE]` and stop at it immediately, even if the connection
+stays open or later events share the same chunk. Malformed events, server errors,
+premature EOF and unsupported tool calls are explicit failures. Partial answer
+text survives interruption; terminal reasoning never enters assistant history.
+Empty successful responses produce a no-answer diagnostic, not permanent typing.
+
+Opt-in checkpoint acceptance attaches only to a supplied gateway:
+
+```sh
+cd c
+COLI_STREAM_BASE_URL=http://127.0.0.1:18775 \
+COLI_STREAM_MODEL_ID=olmoe-colibri \
+python3.13 -m unittest -v tests.test_streaming_model
+```
+
+Provide `COLI_API_KEY` through the environment when authentication is enabled.
+The owner configures `CTX=128` and a generation ceiling of at least 64 tokens.
+The suite compares JSON/SSE answers and usage on OpenAI chat, completions and
+Anthropic messages, checks context rejection before commitment, and exercises
+mid-generation disconnect/recovery. It never launches/stops a gateway or
+downloads/changes weights. Normal discovery skips only when both streaming
+variables are unset; providing just one is an error.
+
 
 ## Legacy protocol (`run_serve`, `coli chat`)
 

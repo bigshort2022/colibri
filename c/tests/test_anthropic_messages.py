@@ -34,6 +34,8 @@ class FakeEngine:
                  on_tool=None):
         self.prompts.append(prompt)
         self.emitted = 0
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 11})
         for chunk in self.script:
             on_text(chunk)
             self.emitted += 1
@@ -308,7 +310,7 @@ class MessagesHTTPTest(unittest.TestCase):
                  and p["content_block"]["type"] == "tool_use"]
         self.assertEqual(len(start), 1)
         self.assertEqual(start[0]["content_block"]["name"], "f")
-        self.assertEqual(start[0]["index"], 1)      # block 0 is the text block
+        self.assertEqual(start[0]["index"], 0)      # first actual block is tool use
         self.assertEqual(payloads[-2]["delta"]["stop_reason"], "tool_use")
 
     def test_thinking_enabled_renders_reasoning_prompt(self):
@@ -423,6 +425,99 @@ class MessagesHTTPTest(unittest.TestCase):
             self.addCleanup(caught.exception.close)
             self.assertEqual(caught.exception.code, 400)
             self.assertIn(field, json.load(caught.exception)["error"]["message"])
+
+
+    def test_stream_rejection_before_accept_is_http_error(self):
+        def reject(*args, **kwargs):
+            raise APIError(400, "context exceeded", "messages", "context_length_exceeded")
+        with patch.object(self.engine, "generate", side_effect=reject):
+            with self.assertRaises(HTTPError) as caught:
+                self.post(self.base_body(stream=True))
+        self.assertEqual(caught.exception.code, 400)
+        payload = json.load(caught.exception)
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["message"], "context exceeded")
+
+    def test_stream_input_usage_at_accept_and_legacy_terminal(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                def generate(*args, on_accept=None, **kwargs):
+                    if not legacy:
+                        on_accept({"prompt_tokens": 11})
+                    args[4]("answer")
+                    return {"prompt_tokens": 11, "completion_tokens": 3, "length_limited": False}
+                with patch.object(self.engine, "generate", side_effect=generate):
+                    with self.post(self.base_body(stream=True)) as response:
+                        raw = response.read().decode()
+                payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                            if line.startswith("data: ")]
+                self.assertEqual(payloads[0]["message"]["usage"]["input_tokens"],
+                                 0 if legacy else 11)
+                self.assertEqual(payloads[-2]["usage"]["input_tokens"], 11)
+
+    def test_reopened_thinking_owns_new_monotonic_blocks(self):
+        script = "first</think>answer<think>second</think>last"
+        for width in (1, 2, len(script)):
+            with self.subTest(width=width):
+                self.engine.script = tuple(script[i:i + width]
+                                           for i in range(0, len(script), width))
+                with self.post(self.base_body(stream=True,
+                                              thinking={"type": "enabled"})) as response:
+                    raw = response.read().decode()
+                payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                            if line.startswith("data: ")]
+                active, starts, closed = None, [], []
+                reasoning, text = [], []
+                for payload in payloads:
+                    kind = payload["type"]
+                    if kind == "content_block_start":
+                        self.assertIsNone(active)
+                        active = payload["index"]
+                        starts.append((active, payload["content_block"]["type"]))
+                    elif kind == "content_block_delta":
+                        self.assertEqual(payload["index"], active)
+                        reasoning.append(payload["delta"].get("thinking", ""))
+                        text.append(payload["delta"].get("text", ""))
+                    elif kind == "content_block_stop":
+                        self.assertEqual(payload["index"], active)
+                        closed.append(active)
+                        active = None
+                self.assertEqual(starts, [(0, "thinking"), (1, "text"),
+                                          (2, "thinking"), (3, "text")])
+                self.assertEqual(closed, [0, 1, 2, 3])
+                self.assertEqual("".join(reasoning), "firstsecond")
+                self.assertEqual("".join(text), "answerlast")
+                self.assertEqual(payloads[-1]["type"], "message_stop")
+
+    def test_streamed_budget_exhaustion_closes_only_actual_thinking(self):
+        self.engine.script = ("unfinished",)
+        self.engine.length_limited = True
+        with self.post(self.base_body(stream=True, thinking={"type": "enabled"})) as response:
+            raw = response.read().decode()
+        payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                    if line.startswith("data: ")]
+        self.assertEqual([p["index"] for p in payloads if p["type"] == "content_block_start"],
+                         [0])
+        self.assertEqual([p["index"] for p in payloads if p["type"] == "content_block_stop"],
+                         [0])
+        self.assertEqual(payloads[-2]["delta"]["stop_reason"], "max_tokens")
+
+    def test_content_precedes_tool_block_with_fragmented_markers(self):
+        self.engine.script = tuple("checking</think>Let me check. <tool_call>f"
+                                   "<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>")
+        with self.post(self.base_body(stream=True, thinking={"type": "enabled"},
+                                      tools=[{"name": "f", "input_schema": {"type": "object",
+                                              "properties": {"x": {"type": "string"}}}}])) as response:
+            raw = response.read().decode()
+        payloads = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        starts = [p for p in payloads if p["type"] == "content_block_start"]
+        self.assertEqual([(p["index"], p["content_block"]["type"]) for p in starts],
+                         [(0, "thinking"), (1, "text"), (2, "tool_use")])
+        self.assertEqual("".join(p["delta"].get("text", "") for p in payloads
+                                 if p["type"] == "content_block_delta"), "Let me check. ")
+        self.assertEqual([p["index"] for p in payloads if p["type"] == "content_block_stop"],
+                         [0, 1, 2])
+        self.assertEqual(payloads[-2]["delta"]["stop_reason"], "tool_use")
 
 
 if __name__ == "__main__":

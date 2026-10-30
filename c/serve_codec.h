@@ -168,7 +168,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
 {
     char *line;
     size_t count = 0;
-    char *fields[10];
+    char *fields[11];
     int nfields = 0;
 
     if (!input || !profile || !command) return COLI_SERVE_READ_BAD_FRAME;
@@ -184,12 +184,11 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
             return count ? COLI_SERVE_READ_BAD_FRAME : COLI_SERVE_READ_EOF;
         }
         if (ch == '\n') break;
-        if (count == maximum) {
-            do ch = fgetc(input); while (ch != EOF && ch != '\n');
+        if (ch == 0 || count == maximum) {
             line[count] = 0;
             coli_serve_classify_line(line, command);
             free(line);
-            return COLI_SERVE_READ_BAD_REQUEST;
+            return COLI_SERVE_READ_BAD_FRAME;
         }
         line[count++] = (char)ch;
     }
@@ -203,7 +202,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         if (!*cursor) break;
         if (nfields == (int)(sizeof(fields) / sizeof(fields[0]))) {
             free(line);
-            return COLI_SERVE_READ_BAD_REQUEST;
+            return COLI_SERVE_READ_BAD_FRAME;
         }
         fields[nfields++] = cursor;
         while (*cursor && *cursor != ' ' && *cursor != '\t') cursor++;
@@ -223,7 +222,9 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     }
     if (nfields < 2 || strlen(fields[1]) >= sizeof(command->id)) {
         free(line);
-        return COLI_SERVE_READ_BAD_REQUEST;
+        return (command->kind == COLI_SERVE_COMMAND_SUBMIT ||
+                command->kind == COLI_SERVE_COMMAND_IMAGE)
+                   ? COLI_SERVE_READ_BAD_FRAME : COLI_SERVE_READ_BAD_REQUEST;
     }
     memcpy(command->id, fields[1], strlen(fields[1]) + 1);
     if (command->kind == COLI_SERVE_COMMAND_STOP ||
@@ -241,97 +242,95 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
          * un'intestazione. Per questo il rifiuto vive nel chiamante, non qui. */
         if (nfields != 5 ||
             !coli_serve_parse_u64(fields[2], &command->payload_bytes) ||
+            command->payload_bytes > profile->max_payload_bytes ||
+            command->payload_bytes > SIZE_MAX - 1) {
+            free(line);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        int bad_request =
             !coli_serve_parse_i32(fields[3], &command->grid_h) ||
             !coli_serve_parse_i32(fields[4], &command->grid_w) ||
-            command->payload_bytes > profile->max_payload_bytes ||
-            command->grid_h < 1 || command->grid_w < 1) {
-            free(line);
-            return COLI_SERVE_READ_BAD_REQUEST;
-        }
+            command->grid_h < 1 || command->grid_w < 1;
         free(line);
         command->payload = (unsigned char *)allocate((size_t)command->payload_bytes + 1);
         if (!command->payload) return COLI_SERVE_READ_NOMEM;
         if (command->payload_bytes &&
             fread(command->payload, 1, (size_t)command->payload_bytes, input)
                 != (size_t)command->payload_bytes) {
-            coli_serve_command_dispose(command);
+            free(command->payload);
+            command->payload = NULL;
             return COLI_SERVE_READ_BAD_FRAME;
         }
         command->payload[command->payload_bytes] = 0;
         int terminator = fgetc(input);
         if (terminator != '\n' && !(terminator == '\r' && fgetc(input) == '\n')) {
-            coli_serve_command_dispose(command);
+            free(command->payload);
+            command->payload = NULL;
             return COLI_SERVE_READ_BAD_FRAME;
+        }
+        if (bad_request) {
+            free(command->payload);
+            command->payload = NULL;
+            return COLI_SERVE_READ_BAD_REQUEST;
         }
         return COLI_SERVE_READ_OK;
     }
-    int minimum_fields = 7;
-    int maximum_fields = minimum_fields + !!profile->allow_extension_bytes +
-                         !!profile->allow_prefix_hint;
-    /* I token key=value vengono dopo i campi posizionali. Il primo campo che
-     * contiene '=' apre l'estensione: da li in poi il conteggio posizionale si
-     * ferma, e le regole (chiavi note, niente duplicati, valori in campo) sono
-     * quelle di coli_submit_ext, non una seconda copia scritta qui. */
+    const int minimum_fields = 7;
+    /* Named extensions follow the positional text/extension lengths. Parse
+     * framing before admission: even an invalid option must not leave prompt
+     * bytes to be interpreted as another command. */
     int positional = nfields;
     for (int f = minimum_fields; f < nfields; f++)
         if (strchr(fields[f], '=')) { positional = f; break; }
-    command->logprobs = 0;
-    command->pin = 0;
+    command->extension_bytes = 0;
+    command->prefix_bytes = 0;
+    uint64_t extension_limit = profile->max_extension_bytes
+                                   ? profile->max_extension_bytes
+                                   : profile->max_payload_bytes;
+    if (positional < minimum_fields || positional > 9 ||
+        !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
+        (positional >= 8 &&
+         !coli_serve_parse_u64(fields[7], &command->extension_bytes)) ||
+        command->payload_bytes > profile->max_payload_bytes ||
+        command->extension_bytes > extension_limit ||
+        command->payload_bytes > SIZE_MAX - 1 ||
+        command->extension_bytes > SIZE_MAX - 1 - (size_t)command->payload_bytes) {
+        free(line);
+        return COLI_SERVE_READ_BAD_FRAME;
+    }
+
+    int bad_request =
+        !coli_serve_parse_i32(fields[2], &command->slot) ||
+        !coli_serve_parse_i32(fields[4], &command->max_tokens) ||
+        !coli_serve_parse_f32(fields[5], &command->temperature) ||
+        !coli_serve_parse_f32(fields[6], &command->top_p) ||
+        (positional >= 9 &&
+         !coli_serve_parse_i32(fields[8], &command->prefix_bytes)) ||
+        (!profile->allow_extension_bytes && command->extension_bytes != 0) ||
+        (positional >= 9 && !profile->allow_prefix_hint);
     if (positional < nfields) {
         char ext[128]; size_t used = 0; ext[0] = 0;
         for (int f = positional; f < nfields; f++) {
             size_t need = strlen(fields[f]) + 1;
-            if (used + need + 1 >= sizeof ext) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
+            if (used + need + 1 >= sizeof ext) { bad_request = 1; break; }
             ext[used++] = ' ';
             memcpy(ext + used, fields[f], need);
             used += need - 1;
         }
-        {
-            ColiSubmit tmp;
-            memset(&tmp, 0, sizeof tmp);
-            if (!coli_submit_ext(ext, &tmp)) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
-            command->logprobs = tmp.logprobs;
-            command->pin = tmp.pin;
-        }
+        ColiSubmit tmp = {0};
+        if (!coli_submit_ext(ext, &tmp)) bad_request = 1;
+        command->logprobs = tmp.logprobs;
+        command->pin = tmp.pin;
     }
-    if (positional < minimum_fields || positional > maximum_fields ||
-        (positional >= 8 && !profile->allow_extension_bytes) ||
-        (positional >= 9 && (!profile->allow_prefix_hint ||
-                          !profile->allow_extension_bytes))) {
-        free(line);
-        return COLI_SERVE_READ_BAD_REQUEST;
-    }
-    command->extension_bytes = 0;
-    command->prefix_bytes = 0;
-    if (!coli_serve_parse_i32(fields[2], &command->slot) ||
-        !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
-        !coli_serve_parse_i32(fields[4], &command->max_tokens) ||
-        !coli_serve_parse_f32(fields[5], &command->temperature) ||
-        !coli_serve_parse_f32(fields[6], &command->top_p) ||
-        (positional >= 8 &&
-         !coli_serve_parse_u64(fields[7], &command->extension_bytes)) ||
-        (positional >= 9 && !coli_serve_parse_i32(fields[8], &command->prefix_bytes)) ||
-        command->payload_bytes > profile->max_payload_bytes ||
-        command->extension_bytes > profile->max_extension_bytes ||
-        /* max_tokens=0 vale SOLO in modalita jev (logprobs>0) e vuol dire
-         * "leggi il prompt e fermati", niente generazione. Senza, chi punteggia
-         * un menu chiuso deve chiedere almeno un token, e quel token lo paga:
-         * un passo di decodifica completo per opzione, buttato via. Misurato su
-         * qwen36: raddoppia il costo di un'opzione da un token. Una richiesta
-         * che non chiede logprobs continua a essere rifiutata a 0, come prima. */
-        (command->max_tokens < 1 &&
+    /* A zero-token logprobs request reads the prompt without generation. */
+    if ((command->max_tokens < 1 &&
          !(command->max_tokens == 0 && command->logprobs > 0)) ||
         (profile->max_tokens && command->max_tokens > profile->max_tokens) ||
         (profile->require_finite_sampling &&
-         (!isfinite(command->temperature) || !isfinite(command->top_p)))) {
-        free(line);
-        return COLI_SERVE_READ_BAD_REQUEST;
-    }
+         (!isfinite(command->temperature) || !isfinite(command->top_p))))
+        bad_request = 1;
     free(line);
 
-    if (command->payload_bytes > SIZE_MAX - 1 ||
-        command->extension_bytes > SIZE_MAX - 1 - (size_t)command->payload_bytes)
-        return COLI_SERVE_READ_NOMEM;
     size_t payload_bytes = (size_t)command->payload_bytes;
     size_t extension_bytes = (size_t)command->extension_bytes;
     command->payload = allocate(payload_bytes + 1 + extension_bytes);
@@ -340,14 +339,21 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         (extension_bytes &&
          fread(command->payload + payload_bytes + 1, 1, extension_bytes, input) !=
              extension_bytes)) {
-        coli_serve_command_dispose(command);
+        free(command->payload);
+        command->payload = NULL;
         return COLI_SERVE_READ_BAD_FRAME;
     }
     command->payload[payload_bytes] = 0;
     int terminator = fgetc(input);
     if (terminator == EOF || (profile->require_exact_lf && terminator != '\n')) {
-        coli_serve_command_dispose(command);
+        free(command->payload);
+        command->payload = NULL;
         return COLI_SERVE_READ_BAD_FRAME;
+    }
+    if (bad_request) {
+        free(command->payload);
+        command->payload = NULL;
+        return COLI_SERVE_READ_BAD_REQUEST;
     }
     return COLI_SERVE_READ_OK;
 }
